@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     hash::{BuildHasherDefault, Hash},
     ops::{Deref, DerefMut},
     thread::available_parallelism,
@@ -15,6 +16,7 @@ use crate::{
         CachedDataItemValue, CachedDataItemValueRef, CachedDataItemValueRefMut, OutputValue,
     },
     data_storage::{AutoMapStorage, OptionStorage},
+    histogram::Histogram,
     utils::dash_map_multi::{get_multiple_mut, RefMut},
 };
 
@@ -139,6 +141,65 @@ impl InnerStorage {
             dynamic: DynamicStorage::new(),
             persistance_state: PersistanceState::default(),
         }
+    }
+
+    pub fn len(&self) -> usize {
+        use crate::data_storage::Storage;
+        self.dynamic.len()
+            + self.aggregation_number.len()
+            + self.output.len()
+            + self.upper.len()
+            + self.output_dependent.len()
+    }
+
+    pub fn capacity(&self) -> usize {
+        use crate::data_storage::Storage;
+        self.dynamic.capacity()
+            + self.aggregation_number.capacity()
+            + self.output.capacity()
+            + self.upper.capacity()
+            + self.output_dependent.capacity()
+    }
+
+    pub fn size(&self) -> usize {
+        use crate::data_storage::Storage;
+        self.dynamic.size()
+            + self.aggregation_number.size()
+            + self.output.size()
+            + self.upper.size()
+            + self.output_dependent.size()
+    }
+
+    pub fn capacity_size(&self) -> usize {
+        use crate::data_storage::Storage;
+        self.dynamic.capacity_size()
+            + self.aggregation_number.capacity_size()
+            + self.output.capacity_size()
+            + self.upper.capacity_size()
+            + self.output_dependent.capacity_size()
+    }
+
+    pub fn count_histogram(&self, histogram: &mut HashMap<CachedDataItemType, Histogram>) {
+        use crate::data_storage::Storage;
+        for ty in self.dynamic.types() {
+            histogram.entry(ty).or_default().add(self.dynamic.count(ty));
+        }
+        histogram
+            .entry(CachedDataItemType::AggregationNumber)
+            .or_default()
+            .add(self.aggregation_number.len());
+        histogram
+            .entry(CachedDataItemType::Output)
+            .or_default()
+            .add(self.output.len());
+        histogram
+            .entry(CachedDataItemType::Upper)
+            .or_default()
+            .add(self.upper.len());
+        histogram
+            .entry(CachedDataItemType::OutputDependent)
+            .or_default()
+            .add(self.output_dependent.len());
     }
 
     pub fn persistance_state(&self) -> &PersistanceState {
@@ -503,6 +564,50 @@ impl InnerStorage {
 
 pub struct Storage {
     map: DashMap<TaskId, Box<InnerStorage>, BuildHasherDefault<FxHasher>>,
+}
+
+impl Storage {
+    pub fn data_len(&self) -> usize {
+        self.map
+            .iter()
+            .map(|key_value| key_value.value().len())
+            .sum::<usize>()
+    }
+
+    pub fn data_capacity(&self) -> usize {
+        self.map
+            .iter()
+            .map(|key_value| key_value.value().capacity())
+            .sum::<usize>()
+    }
+
+    pub fn size(&self) -> usize {
+        self.map
+            .iter()
+            .map(|key_value| key_value.value().size())
+            .sum::<usize>()
+            + self.map.len() * size_of::<(TaskId, InnerStorage)>()
+    }
+
+    pub fn capacity_size(&self) -> usize {
+        self.map
+            .iter()
+            .map(|key_value| key_value.value().capacity_size())
+            .sum::<usize>()
+            + self.map.capacity() * size_of::<(TaskId, InnerStorage)>()
+    }
+
+    pub fn tasks(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn count_histogram(&self) -> HashMap<CachedDataItemType, Histogram> {
+        let mut histogram = HashMap::new();
+        for pair in self.map.iter() {
+            pair.value().count_histogram(&mut histogram);
+        }
+        histogram
+    }
 }
 
 impl Storage {
