@@ -309,7 +309,7 @@ impl CodeGenerateable for EsmAssetReference {
                             id.to_string().into(),
                             var_decl_with_span(
                                 quote!(
-                                    "var $name = __turbopack_import__($id);" as Stmt,
+                                    "var $name = __turbopack_context__.i($id);" as Stmt,
                                     name = Ident::new(name.clone().into(), DUMMY_SP, Default::default()),
                                     id: Expr = module_id_to_lit(&id),
                                 ),
@@ -335,13 +335,13 @@ impl CodeGenerateable for EsmAssetReference {
                             var_decl_with_span(
                                 if import_externals {
                                     quote!(
-                                        "var $name = __turbopack_external_import__($id);" as Stmt,
+                                        "var $name = __turbopack_context__.y($id);" as Stmt,
                                         name = Ident::new(ident.clone().into(), DUMMY_SP, Default::default()),
                                         id: Expr = Expr::Lit(request.clone().to_string().into())
                                     )
                                 } else {
                                     quote!(
-                                        "var $name = __turbopack_external_require__($id, () => require($id), true);" as Stmt,
+                                        "var $name = __turbopack_context__.x($id, () => require($id), true);" as Stmt,
                                         name = Ident::new(ident.clone().into(), DUMMY_SP, Default::default()),
                                         id: Expr = Expr::Lit(request.clone().to_string().into())
                                     )
@@ -370,7 +370,7 @@ impl CodeGenerateable for EsmAssetReference {
                             ident.clone().into(),
                             var_decl_with_span(
                                 quote!(
-                                    "var $name = __turbopack_external_require__($id, () => require($id), true);" as Stmt,
+                                    "var $name = __turbopack_context__.x($id, () => require($id), true);" as Stmt,
                                     name = Ident::new(ident.clone().into(), DUMMY_SP, Default::default()),
                                     id: Expr = Expr::Lit(request.clone().to_string().into())
                                 ),
