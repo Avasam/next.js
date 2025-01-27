@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use tracing::Instrument;
 use turbo_rcstr::RcStr;
 use turbo_tasks::{
     apply_effects, ReadConsistency, ResolvedVc, TransientInstance, TryJoinIterExt, TurboTasks,
@@ -135,7 +136,9 @@ impl TurbopackBuildBuilder {
             // Await the result to propagate any errors.
             build_result_op.read_strongly_consistent().await?;
 
-            apply_effects(build_result_op).await?;
+            apply_effects(build_result_op)
+                .instrument(tracing::info_span!("apply effects"))
+                .await?;
 
             let issue_reporter: Vc<Box<dyn IssueReporter>> =
                 Vc::upcast(ConsoleUi::new(TransientInstance::new(LogOptions {
@@ -253,28 +256,38 @@ async fn build_internal(
 
     let origin = PlainResolveOrigin::new(asset_context, project_fs.root().join("_".into()));
     let project_dir = &project_dir;
-    let entries = entry_requests
-        .into_iter()
-        .map(|request_vc| async move {
-            let ty = Value::new(ReferenceType::Entry(EntryReferenceSubType::Undefined));
-            let request = request_vc.await?;
-            origin
-                .resolve_asset(request_vc, origin.resolve_options(ty.clone()), ty)
-                .await?
-                .first_module()
-                .await?
-                .with_context(|| {
-                    format!(
-                        "Unable to resolve entry {} from directory {}.",
-                        request.request().unwrap(),
-                        project_dir
-                    )
-                })
-        })
-        .try_join()
-        .await?;
+    let entries = async move {
+        entry_requests
+            .into_iter()
+            .map(|request_vc| async move {
+                let ty = Value::new(ReferenceType::Entry(EntryReferenceSubType::Undefined));
+                let request = request_vc.await?;
+                origin
+                    .resolve_asset(request_vc, origin.resolve_options(ty.clone()), ty)
+                    .await?
+                    .first_module()
+                    .await?
+                    .with_context(|| {
+                        format!(
+                            "Unable to resolve entry {} from directory {}.",
+                            request.request().unwrap(),
+                            project_dir
+                        )
+                    })
+            })
+            .try_join()
+            .await
+    }
+    .instrument(tracing::info_span!("resolve entries"))
+    .await?;
 
-    let module_graph = ModuleGraph::from_modules(Vc::cell(entries.clone()));
+    let module_graph = async {
+        ModuleGraph::from_modules(Vc::cell(entries.clone()))
+            .resolve()
+            .await
+    }
+    .instrument(tracing::info_span!("prepare module graph"))
+    .await?;
     let module_id_strategy = ResolvedVc::upcast(
         get_global_module_id_strategy(module_graph)
             .to_resolved()
@@ -352,16 +365,40 @@ async fn build_internal(
 
     let entry_chunk_groups = entries
         .into_iter()
-        .map(|entry_module| async move {
-            Ok(
-                if let Some(ecmascript) =
-                    ResolvedVc::try_sidecast::<Box<dyn EvaluatableAsset>>(entry_module).await?
-                {
-                    match target {
-                        Target::Browser => {
-                            chunking_context
-                                .evaluated_chunk_group(
-                                    AssetIdent::from_path(
+        .map(async |entry_module| {
+            async move {
+                Ok(
+                    if let Some(ecmascript) =
+                        ResolvedVc::try_sidecast::<Box<dyn EvaluatableAsset>>(entry_module).await?
+                    {
+                        match target {
+                            Target::Browser => {
+                                chunking_context
+                                    .evaluated_chunk_group(
+                                        AssetIdent::from_path(
+                                            build_output_root
+                                                .join(
+                                                    ecmascript
+                                                        .ident()
+                                                        .path()
+                                                        .file_stem()
+                                                        .await?
+                                                        .as_deref()
+                                                        .unwrap()
+                                                        .into(),
+                                                )
+                                                .with_extension("entry.js".into()),
+                                        ),
+                                        EvaluatableAssets::one(*ResolvedVc::upcast(ecmascript)),
+                                        module_graph,
+                                        Value::new(AvailabilityInfo::Root),
+                                    )
+                                    .await?
+                                    .assets
+                            }
+                            Target::Node => ResolvedVc::cell(vec![
+                                chunking_context
+                                    .entry_chunk_group(
                                         build_output_root
                                             .join(
                                                 ecmascript
@@ -374,58 +411,46 @@ async fn build_internal(
                                                     .into(),
                                             )
                                             .with_extension("entry.js".into()),
-                                    ),
-                                    EvaluatableAssets::one(*ResolvedVc::upcast(ecmascript)),
-                                    module_graph,
-                                    Value::new(AvailabilityInfo::Root),
-                                )
-                                .await?
-                                .assets
+                                        *ResolvedVc::upcast(ecmascript),
+                                        EvaluatableAssets::one(*ResolvedVc::upcast(ecmascript)),
+                                        module_graph,
+                                        OutputAssets::empty(),
+                                        Value::new(AvailabilityInfo::Root),
+                                    )
+                                    .await?
+                                    .asset,
+                            ]),
                         }
-                        Target::Node => ResolvedVc::cell(vec![
-                            chunking_context
-                                .entry_chunk_group(
-                                    build_output_root
-                                        .join(
-                                            ecmascript
-                                                .ident()
-                                                .path()
-                                                .file_stem()
-                                                .await?
-                                                .as_deref()
-                                                .unwrap()
-                                                .into(),
-                                        )
-                                        .with_extension("entry.js".into()),
-                                    *ResolvedVc::upcast(ecmascript),
-                                    EvaluatableAssets::one(*ResolvedVc::upcast(ecmascript)),
-                                    module_graph,
-                                    OutputAssets::empty(),
-                                    Value::new(AvailabilityInfo::Root),
-                                )
-                                .await?
-                                .asset,
-                        ]),
-                    }
-                } else {
-                    bail!(
-                        "Entry module is not chunkable, so it can't be used to bootstrap the \
-                         application"
-                    )
-                },
-            )
+                    } else {
+                        bail!(
+                            "Entry module is not chunkable, so it can't be used to bootstrap the \
+                             application"
+                        )
+                    },
+                )
+            }
+            .instrument(tracing::info_span!("chunk entry"))
+            .await
         })
         .try_join()
         .await?;
 
     let mut chunks: HashSet<ResolvedVc<Box<dyn OutputAsset>>> = HashSet::new();
     for chunk_group in entry_chunk_groups {
-        chunks.extend(&*all_assets_from_entries(*chunk_group).await?);
+        chunks.extend(
+            &*async move { all_assets_from_entries(*chunk_group).await }
+                .instrument(tracing::info_span!("list chunks"))
+                .await?,
+        );
     }
 
     chunks
         .iter()
-        .map(|c| c.content().write(c.ident().path()))
+        .map(async |c| {
+            async move { c.content().write(c.ident().path()).resolve().await }
+                .instrument(tracing::info_span!("build chunk content"))
+                .await
+        })
         .try_join()
         .await?;
 
