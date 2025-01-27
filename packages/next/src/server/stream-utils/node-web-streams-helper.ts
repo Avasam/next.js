@@ -532,7 +532,8 @@ function chainTransformers<T>(
 export type ContinueStreamOptions = {
   inlinedDataStream: ReadableStream<Uint8Array> | undefined
   isStaticGeneration: boolean
-  getServerInsertedHTML: (() => Promise<string>) | undefined
+  getServerInsertedHTML: () => Promise<string>
+  getServerInsertedMetadata: () => Promise<string>
   serverInsertedHTMLToHead: boolean
   validateRootLayout?: boolean
   /**
@@ -548,6 +549,7 @@ export async function continueFizzStream(
     inlinedDataStream,
     isStaticGeneration,
     getServerInsertedHTML,
+    getServerInsertedMetadata,
     serverInsertedHTMLToHead,
     validateRootLayout,
   }: ContinueStreamOptions
@@ -566,9 +568,12 @@ export async function continueFizzStream(
     createBufferedTransformStream(),
 
     // Insert generated tags to head
-    getServerInsertedHTML && !serverInsertedHTMLToHead
+    !serverInsertedHTMLToHead
       ? createInsertedHTMLStream(getServerInsertedHTML)
       : null,
+
+    // Insert generated metadata to body
+    createInsertedHTMLStream(getServerInsertedMetadata),
 
     // Insert suffix content
     suffixUnclosed != null && suffixUnclosed.length > 0
@@ -587,7 +592,7 @@ export async function continueFizzStream(
     // Special head insertions
     // TODO-APP: Insert server side html to end of head in app layout rendering, to avoid
     // hydration errors. Remove this once it's ready to be handled by react itself.
-    getServerInsertedHTML && serverInsertedHTMLToHead
+    serverInsertedHTMLToHead
       ? createHeadInsertionTransformStream(getServerInsertedHTML)
       : null,
   ])
@@ -608,6 +613,7 @@ export async function continueDynamicPrerender(
       .pipeThrough(createStripDocumentClosingTagsTransform())
       // Insert generated tags to head
       .pipeThrough(createHeadInsertionTransformStream(getServerInsertedHTML))
+    // Insert generated metadata to body
   )
 }
 
