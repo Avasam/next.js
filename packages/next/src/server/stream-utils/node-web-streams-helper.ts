@@ -600,11 +600,15 @@ export async function continueFizzStream(
 
 type ContinueDynamicPrerenderOptions = {
   getServerInsertedHTML: () => Promise<string>
+  getServerInsertedMetadata: () => Promise<string>
 }
 
 export async function continueDynamicPrerender(
   prerenderStream: ReadableStream<Uint8Array>,
-  { getServerInsertedHTML }: ContinueDynamicPrerenderOptions
+  {
+    getServerInsertedHTML,
+    getServerInsertedMetadata,
+  }: ContinueDynamicPrerenderOptions
 ) {
   return (
     prerenderStream
@@ -613,18 +617,24 @@ export async function continueDynamicPrerender(
       .pipeThrough(createStripDocumentClosingTagsTransform())
       // Insert generated tags to head
       .pipeThrough(createHeadInsertionTransformStream(getServerInsertedHTML))
-    // Insert generated metadata to body
+      // Insert generated metadata to body
+      .pipeThrough(createInsertedHTMLStream(getServerInsertedMetadata))
   )
 }
 
 type ContinueStaticPrerenderOptions = {
   inlinedDataStream: ReadableStream<Uint8Array>
   getServerInsertedHTML: () => Promise<string>
+  getServerInsertedMetadata: () => Promise<string>
 }
 
 export async function continueStaticPrerender(
   prerenderStream: ReadableStream<Uint8Array>,
-  { inlinedDataStream, getServerInsertedHTML }: ContinueStaticPrerenderOptions
+  {
+    inlinedDataStream,
+    getServerInsertedHTML,
+    getServerInsertedMetadata,
+  }: ContinueStaticPrerenderOptions
 ) {
   return (
     prerenderStream
@@ -632,6 +642,8 @@ export async function continueStaticPrerender(
       .pipeThrough(createBufferedTransformStream())
       // Insert generated tags to head
       .pipeThrough(createHeadInsertionTransformStream(getServerInsertedHTML))
+      // Insert generated metadata to body
+      .pipeThrough(createInsertedHTMLStream(getServerInsertedMetadata))
       // Insert the inlined data (Flight data, form state, etc.) stream into the HTML
       .pipeThrough(createMergedTransformStream(inlinedDataStream))
       // Close tags should always be deferred to the end
@@ -642,11 +654,16 @@ export async function continueStaticPrerender(
 type ContinueResumeOptions = {
   inlinedDataStream: ReadableStream<Uint8Array>
   getServerInsertedHTML: () => Promise<string>
+  getServerInsertedMetadata: () => Promise<string>
 }
 
 export async function continueDynamicHTMLResume(
   renderStream: ReadableStream<Uint8Array>,
-  { inlinedDataStream, getServerInsertedHTML }: ContinueResumeOptions
+  {
+    inlinedDataStream,
+    getServerInsertedHTML,
+    getServerInsertedMetadata,
+  }: ContinueResumeOptions
 ) {
   return (
     renderStream
@@ -654,6 +671,8 @@ export async function continueDynamicHTMLResume(
       .pipeThrough(createBufferedTransformStream())
       // Insert generated tags to head
       .pipeThrough(createHeadInsertionTransformStream(getServerInsertedHTML))
+      // Insert generated metadata to body
+      .pipeThrough(createInsertedHTMLStream(getServerInsertedMetadata))
       // Insert the inlined data (Flight data, form state, etc.) stream into the HTML
       .pipeThrough(createMergedTransformStream(inlinedDataStream))
       // Close tags should always be deferred to the end

@@ -1907,6 +1907,7 @@ async function renderToStream(
             formState
           ),
           getServerInsertedHTML,
+          getServerInsertedMetadata,
         })
       }
     }
@@ -3046,6 +3047,7 @@ async function prerenderToStream(
             ssrErrors: allCapturedErrors,
             stream: await continueDynamicPrerender(prelude, {
               getServerInsertedHTML,
+              getServerInsertedMetadata,
             }),
             dynamicAccess: consumeDynamicAccess(
               serverDynamicTracking,
@@ -3107,6 +3109,7 @@ async function prerenderToStream(
                 formState
               ),
               getServerInsertedHTML,
+              getServerInsertedMetadata,
             }),
             dynamicAccess: consumeDynamicAccess(
               serverDynamicTracking,
@@ -3686,6 +3689,7 @@ async function prerenderToStream(
           ssrErrors: allCapturedErrors,
           stream: await continueDynamicPrerender(prelude, {
             getServerInsertedHTML,
+            getServerInsertedMetadata,
           }),
           dynamicAccess: dynamicTracking.dynamicAccesses,
           // TODO: Should this include the SSR pass?
@@ -3705,6 +3709,7 @@ async function prerenderToStream(
           ssrErrors: allCapturedErrors,
           stream: await continueDynamicPrerender(prelude, {
             getServerInsertedHTML,
+            getServerInsertedMetadata,
           }),
           dynamicAccess: dynamicTracking.dynamicAccesses,
           // TODO: Should this include the SSR pass?
@@ -3764,6 +3769,7 @@ async function prerenderToStream(
               formState
             ),
             getServerInsertedHTML,
+            getServerInsertedMetadata,
           }),
           dynamicAccess: dynamicTracking.dynamicAccesses,
           // TODO: Should this include the SSR pass?

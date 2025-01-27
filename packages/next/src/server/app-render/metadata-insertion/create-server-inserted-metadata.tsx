@@ -1,4 +1,3 @@
-import type { JSX } from 'react'
 import { renderToReadableStream } from 'react-dom/server.edge'
 import {
   ServerInsertedMetadataContext,
@@ -8,7 +7,6 @@ import { renderToString } from '../render-to-string'
 
 export function createServerInsertedMetadata() {
   let metadataResolver: MetadataResolver | null = null
-  let metadataToFlush: JSX.Element | null = null
   let setMetadataResolver = (resolver: MetadataResolver): void => {
     metadataResolver = resolver
   }
@@ -27,20 +25,17 @@ export function createServerInsertedMetadata() {
     },
 
     async getServerInsertedMetadata(): Promise<string> {
-      if (
-        // resolver is not set yet
-        metadataResolver === null ||
-        // metadata is already flushed
-        metadataToFlush !== null
-      ) {
+      // resolver is not passed from hook to context yet
+      if (metadataResolver === null) {
         return ''
       }
 
-      metadataToFlush = metadataResolver()
-      return await renderToString({
+      const metadata = metadataResolver()
+      const metadataHtml = await renderToString({
         renderToReadableStream,
-        element: metadataToFlush,
+        element: metadata,
       })
+      return metadataHtml
     },
   }
 }
