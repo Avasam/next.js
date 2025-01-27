@@ -37,7 +37,7 @@ use crate::{
     magic_identifier,
     references::util::{request_to_string, throw_module_not_found_expr},
     tree_shake::{asset::EcmascriptModulePartAsset, TURBOPACK_PART_IMPORT_SOURCE},
-    utils::module_id_to_lit,
+    utils::{module_id_to_lit, StringifyJs},
 };
 
 #[turbo_tasks::value]
@@ -49,9 +49,15 @@ pub enum ReferencedAsset {
 }
 
 impl ReferencedAsset {
-    pub async fn get_ident(&self) -> Result<Option<String>> {
+    pub async fn get_ident(
+        &self,
+        module_graph: Vc<ModuleGraph>,
+        chunking_context: Vc<Box<dyn ChunkingContext>>,
+    ) -> Result<Option<String>> {
         Ok(match self {
-            ReferencedAsset::Some(asset) => Some(Self::get_ident_from_placeable(asset).await?),
+            ReferencedAsset::Some(asset) => {
+                Some(Self::get_ident_from_placeable(asset, module_graph, chunking_context).await?)
+            }
             ReferencedAsset::External(request, ty) => Some(magic_identifier::mangle(&format!(
                 "{ty} external {request}"
             ))),
@@ -61,11 +67,16 @@ impl ReferencedAsset {
 
     pub(crate) async fn get_ident_from_placeable(
         asset: &Vc<Box<dyn EcmascriptChunkPlaceable>>,
+        module_graph: Vc<ModuleGraph>,
+        chunking_context: Vc<Box<dyn ChunkingContext>>,
     ) -> Result<String> {
-        let path = asset.ident().to_string().await?;
+        let id = asset
+            .as_chunk_item(module_graph, Vc::upcast(chunking_context))
+            .id()
+            .await?;
         Ok(magic_identifier::mangle(&format!(
-            "imported module {}",
-            path
+            "imported {}",
+            StringifyJs(&*id)
         )))
     }
 }
@@ -272,7 +283,10 @@ impl CodeGenerateable for EsmAssetReference {
                     span: DUMMY_SP,
                 });
                 Some((format!("throw {request}").into(), stmt))
-            } else if let Some(ident) = referenced_asset.get_ident().await? {
+            } else if let Some(ident) = referenced_asset
+                .get_ident(module_graph, chunking_context)
+                .await?
+            {
                 let span = this
                     .issue_source
                     .await?
@@ -290,12 +304,13 @@ impl CodeGenerateable for EsmAssetReference {
                             .as_chunk_item(module_graph, Vc::upcast(chunking_context))
                             .id()
                             .await?;
+                        let name = ident;
                         Some((
-                            ident.clone().into(),
+                            id.to_string().into(),
                             var_decl_with_span(
                                 quote!(
                                     "var $name = __turbopack_import__($id);" as Stmt,
-                                    name = Ident::new(ident.clone().into(), DUMMY_SP, Default::default()),
+                                    name = Ident::new(name.clone().into(), DUMMY_SP, Default::default()),
                                     id: Expr = module_id_to_lit(&id),
                                 ),
                                 span,
