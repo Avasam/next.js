@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     ops::ControlFlow,
 };
 
@@ -338,7 +338,7 @@ pub struct ExpandStarResult {
 pub async fn expand_star_exports(
     root_module: Vc<Box<dyn EcmascriptChunkPlaceable>>,
 ) -> Result<Vc<ExpandStarResult>> {
-    let mut set = HashSet::new();
+    let mut set = BTreeSet::new();
     let mut has_dynamic_exports = false;
     let mut checked_modules = HashSet::new();
     checked_modules.insert(root_module);
