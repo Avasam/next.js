@@ -53,7 +53,9 @@ use swc_core::{
 };
 use tracing::Instrument;
 use turbo_rcstr::RcStr;
-use turbo_tasks::{FxIndexSet, ResolvedVc, TryJoinIterExt, Upcast, Value, ValueToString, Vc};
+use turbo_tasks::{
+    FxIndexSet, ReadRef, ResolvedVc, TryJoinIterExt, Upcast, Value, ValueToString, Vc,
+};
 use turbo_tasks_fs::FileSystemPath;
 use turbopack_core::{
     compile_time_info::{
@@ -144,8 +146,8 @@ use crate::{
     },
     tree_shake::{find_turbopack_part_id_in_asserts, part_of_module, split},
     utils::{module_value_to_well_known_object, AstPathRange},
-    EcmascriptInputTransforms, EcmascriptModuleAsset, EcmascriptParsable, SpecifiedModuleType,
-    TreeShakingMode,
+    EcmascriptInputTransforms, EcmascriptModuleAsset, EcmascriptOptions, EcmascriptParsable,
+    SpecifiedModuleType, TreeShakingMode,
 };
 
 #[turbo_tasks::value(shared)]
@@ -350,6 +352,7 @@ struct AnalysisState<'a> {
     /// This is the current state of known values of function
     /// arguments.
     fun_args_values: Mutex<FxHashMap<u32, Vec<JsValue>>>,
+    var_cache: Mutex<FxHashMap<Id, JsValue>>,
     // There can be many references to import.meta, but only the first should hoist
     // the object allocation.
     first_import_meta: bool,
@@ -362,8 +365,7 @@ struct AnalysisState<'a> {
 impl AnalysisState<'_> {
     /// Links a value to the graph, returning the linked value.
     async fn link_value(&self, value: JsValue, attributes: &ImportAttributes) -> Result<JsValue> {
-        let fun_args_values = self.fun_args_values.lock().clone();
-        link(
+        Ok(link(
             self.var_graph,
             value,
             &early_value_visitor,
@@ -376,9 +378,11 @@ impl AnalysisState<'_> {
                     attributes,
                 )
             },
-            fun_args_values,
+            &self.fun_args_values,
+            &self.var_cache,
         )
-        .await
+        .await?
+        .0)
     }
 }
 
@@ -934,7 +938,8 @@ pub(crate) async fn analyse_ecmascript_module_internal(
             origin,
             compile_time_info,
             var_graph: &var_graph,
-            fun_args_values: Mutex::new(FxHashMap::<u32, Vec<JsValue>>::default()),
+            fun_args_values: Default::default(),
+            var_cache: Default::default(),
             first_import_meta: true,
             tree_shaking_mode: options.tree_shaking_mode,
             import_externals: options.import_externals,
@@ -965,386 +970,458 @@ pub(crate) async fn analyse_ecmascript_module_internal(
                 Action::Effect(effect) => effect,
             };
 
-            let add_effects = |effects: Vec<Effect>| {
+            let add_effects = |queue_stack: &mut Mutex<Vec<Action>>, effects: Vec<Effect>| {
                 queue_stack
                     .lock()
                     .extend(effects.into_iter().map(Action::Effect).rev())
             };
 
-            match effect {
-                Effect::Unreachable { start_ast_path } => {
-                    analysis.add_code_gen(Unreachable::new(
-                        AstPathRange::StartAfter(start_ast_path.to_vec()).resolved_cell(),
-                    ));
-                }
-                Effect::Conditional {
-                    condition,
-                    kind,
-                    ast_path: condition_ast_path,
-                    span: _,
-                    in_try: _,
-                } => {
-                    // Don't replace condition with it's truth-y value, if it has side effects
-                    // (e.g. function calls)
-                    let condition_has_side_effects = condition.has_side_effects();
+            let span = match effect {
+                Effect::Conditional { .. } => tracing::info_span!("Effect::Conditional"),
+                Effect::Call { .. } => tracing::info_span!("Effect::Call"),
+                Effect::MemberCall { .. } => tracing::info_span!("Effect::MemberCall"),
+                Effect::Member { .. } => tracing::info_span!("Effect::Member"),
+                Effect::ImportedBinding { .. } => tracing::info_span!("Effect::ImportedBinding"),
+                Effect::FreeVar { .. } => tracing::info_span!("Effect::FreeVar"),
+                Effect::TypeOf { .. } => tracing::info_span!("Effect::TypeOf"),
+                Effect::ImportMeta { .. } => tracing::info_span!("Effect::ImportMeta"),
+                Effect::Unreachable { .. } => tracing::info_span!("Effect::Unreachable"),
+            };
+            handle_effect(
+                effect,
+                &mut queue_stack,
+                &mut analysis,
+                &mut analysis_state,
+                ignore_effect_span,
+                eval_context,
+                add_effects,
+                &import_references,
+                &options,
+                source,
+            )
+            .instrument(span)
+            .await?;
 
-                    let condition = analysis_state
-                        .link_value(*condition, ImportAttributes::empty_ref())
-                        .await?;
-
-                    macro_rules! inactive {
-                        ($block:ident) => {
-                            analysis.add_code_gen(Unreachable::new(
-                                $block.range.clone().resolved_cell(),
-                            ));
-                        };
+            async fn handle_effect(
+                effect: Effect,
+                queue_stack: &mut Mutex<Vec<Action>>,
+                mut analysis: &mut AnalyzeEcmascriptModuleResultBuilder,
+                analysis_state: &mut AnalysisState<'_>,
+                ignore_effect_span: Option<Span>,
+                eval_context: &EvalContext,
+                add_effects: impl Fn(&mut Mutex<Vec<Action>>, Vec<Effect>) + Sync + Send,
+                import_references: &[ResolvedVc<EsmAssetReference>],
+                options: &ReadRef<EcmascriptOptions>,
+                source: ResolvedVc<Box<dyn Source>>,
+            ) -> Result<()> {
+                match effect {
+                    Effect::Unreachable { start_ast_path } => {
+                        analysis.add_code_gen(Unreachable::new(
+                            AstPathRange::StartAfter(start_ast_path.to_vec()).resolved_cell(),
+                        ));
                     }
-                    macro_rules! condition {
-                        ($expr:expr) => {
-                            if !condition_has_side_effects {
-                                analysis.add_code_gen(ConstantCondition::new(
-                                    Value::new($expr),
-                                    Vc::cell(condition_ast_path.to_vec()),
+                    Effect::Conditional {
+                        condition,
+                        kind,
+                        ast_path: condition_ast_path,
+                        span: _,
+                        in_try: _,
+                    } => {
+                        // Don't replace condition with it's truth-y value, if it has side effects
+                        // (e.g. function calls)
+                        let condition_has_side_effects = condition.has_side_effects();
+
+                        let condition = analysis_state
+                            .link_value(*condition, ImportAttributes::empty_ref())
+                            .await?;
+
+                        macro_rules! inactive {
+                            ($block:ident) => {
+                                analysis.add_code_gen(Unreachable::new(
+                                    $block.range.clone().resolved_cell(),
                                 ));
-                            }
-                        };
-                    }
-                    macro_rules! active {
-                        ($block:ident) => {
-                            queue_stack
-                                .get_mut()
-                                .extend($block.effects.into_iter().map(Action::Effect).rev())
-                        };
-                    }
-                    match *kind {
-                        ConditionalKind::If { then } => match condition.is_truthy() {
-                            Some(true) => {
-                                condition!(ConstantConditionValue::Truthy);
-                                active!(then);
-                            }
-                            Some(false) => {
-                                condition!(ConstantConditionValue::Falsy);
-                                inactive!(then);
-                            }
-                            None => {
-                                active!(then);
-                            }
-                        },
-                        ConditionalKind::Else { r#else } => match condition.is_truthy() {
-                            Some(true) => {
-                                condition!(ConstantConditionValue::Truthy);
-                                inactive!(r#else);
-                            }
-                            Some(false) => {
-                                condition!(ConstantConditionValue::Falsy);
-                                active!(r#else);
-                            }
-                            None => {
-                                active!(r#else);
-                            }
-                        },
-                        ConditionalKind::IfElse { then, r#else }
-                        | ConditionalKind::Ternary { then, r#else } => {
-                            match condition.is_truthy() {
+                            };
+                        }
+                        macro_rules! condition {
+                            ($expr:expr) => {
+                                if !condition_has_side_effects {
+                                    analysis.add_code_gen(ConstantCondition::new(
+                                        Value::new($expr),
+                                        Vc::cell(condition_ast_path.to_vec()),
+                                    ));
+                                }
+                            };
+                        }
+                        macro_rules! active {
+                            ($block:ident) => {
+                                queue_stack
+                                    .get_mut()
+                                    .extend($block.effects.into_iter().map(Action::Effect).rev())
+                            };
+                        }
+                        match *kind {
+                            ConditionalKind::If { then } => match condition.is_truthy() {
                                 Some(true) => {
                                     condition!(ConstantConditionValue::Truthy);
                                     active!(then);
+                                }
+                                Some(false) => {
+                                    condition!(ConstantConditionValue::Falsy);
+                                    inactive!(then);
+                                }
+                                None => {
+                                    active!(then);
+                                }
+                            },
+                            ConditionalKind::Else { r#else } => match condition.is_truthy() {
+                                Some(true) => {
+                                    condition!(ConstantConditionValue::Truthy);
                                     inactive!(r#else);
                                 }
                                 Some(false) => {
                                     condition!(ConstantConditionValue::Falsy);
                                     active!(r#else);
-                                    inactive!(then);
                                 }
                                 None => {
-                                    active!(then);
                                     active!(r#else);
                                 }
-                            }
-                        }
-                        ConditionalKind::IfElseMultiple { then, r#else } => {
-                            match condition.is_truthy() {
-                                Some(true) => {
-                                    condition!(ConstantConditionValue::Truthy);
-                                    for then in then {
+                            },
+                            ConditionalKind::IfElse { then, r#else }
+                            | ConditionalKind::Ternary { then, r#else } => {
+                                match condition.is_truthy() {
+                                    Some(true) => {
+                                        condition!(ConstantConditionValue::Truthy);
                                         active!(then);
-                                    }
-                                    for r#else in r#else {
                                         inactive!(r#else);
                                     }
-                                }
-                                Some(false) => {
-                                    condition!(ConstantConditionValue::Falsy);
-                                    for then in then {
+                                    Some(false) => {
+                                        condition!(ConstantConditionValue::Falsy);
+                                        active!(r#else);
                                         inactive!(then);
                                     }
-                                    for r#else in r#else {
-                                        active!(r#else);
-                                    }
-                                }
-                                None => {
-                                    for then in then {
+                                    None => {
                                         active!(then);
-                                    }
-                                    for r#else in r#else {
                                         active!(r#else);
                                     }
                                 }
                             }
-                        }
-                        ConditionalKind::And { expr } => match condition.is_truthy() {
-                            Some(true) => {
-                                condition!(ConstantConditionValue::Truthy);
-                                active!(expr);
+                            ConditionalKind::IfElseMultiple { then, r#else } => {
+                                match condition.is_truthy() {
+                                    Some(true) => {
+                                        condition!(ConstantConditionValue::Truthy);
+                                        for then in then {
+                                            active!(then);
+                                        }
+                                        for r#else in r#else {
+                                            inactive!(r#else);
+                                        }
+                                    }
+                                    Some(false) => {
+                                        condition!(ConstantConditionValue::Falsy);
+                                        for then in then {
+                                            inactive!(then);
+                                        }
+                                        for r#else in r#else {
+                                            active!(r#else);
+                                        }
+                                    }
+                                    None => {
+                                        for then in then {
+                                            active!(then);
+                                        }
+                                        for r#else in r#else {
+                                            active!(r#else);
+                                        }
+                                    }
+                                }
                             }
-                            Some(false) => {
-                                // The condition value needs to stay since it's used
-                                inactive!(expr);
-                            }
-                            None => {
-                                active!(expr);
-                            }
-                        },
-                        ConditionalKind::Or { expr } => match condition.is_truthy() {
-                            Some(true) => {
-                                // The condition value needs to stay since it's used
-                                inactive!(expr);
-                            }
-                            Some(false) => {
-                                condition!(ConstantConditionValue::Falsy);
-                                active!(expr);
-                            }
-                            None => {
-                                active!(expr);
-                            }
-                        },
-                        ConditionalKind::NullishCoalescing { expr } => {
-                            match condition.is_nullish() {
+                            ConditionalKind::And { expr } => match condition.is_truthy() {
                                 Some(true) => {
-                                    condition!(ConstantConditionValue::Nullish);
+                                    condition!(ConstantConditionValue::Truthy);
                                     active!(expr);
                                 }
                                 Some(false) => {
+                                    // The condition value needs to stay since it's used
                                     inactive!(expr);
                                 }
                                 None => {
                                     active!(expr);
                                 }
-                            }
-                        }
-                    }
-                }
-                Effect::Call {
-                    func,
-                    args,
-                    ast_path,
-                    span,
-                    in_try,
-                    new,
-                } => {
-                    if let Some(ignored) = &ignore_effect_span {
-                        if *ignored == span {
-                            continue;
-                        }
-                    }
-
-                    let func = analysis_state
-                        .link_value(*func, eval_context.imports.get_attributes(span))
-                        .await?;
-
-                    handle_call(
-                        &ast_path,
-                        span,
-                        func,
-                        JsValue::unknown_empty(false, "no this provided"),
-                        args,
-                        &analysis_state,
-                        &add_effects,
-                        &mut analysis,
-                        in_try,
-                        new,
-                    )
-                    .await?;
-                }
-                Effect::MemberCall {
-                    obj,
-                    prop,
-                    mut args,
-                    ast_path,
-                    span,
-                    in_try,
-                    new,
-                } => {
-                    if let Some(ignored) = &ignore_effect_span {
-                        if *ignored == span {
-                            continue;
-                        }
-                    }
-                    let mut obj = analysis_state
-                        .link_value(*obj, ImportAttributes::empty_ref())
-                        .await?;
-                    let prop = analysis_state
-                        .link_value(*prop, ImportAttributes::empty_ref())
-                        .await?;
-
-                    if !new {
-                        if let JsValue::Array {
-                            items: ref mut values,
-                            mutable,
-                            ..
-                        } = obj
-                        {
-                            if matches!(prop.as_str(), Some("map" | "forEach" | "filter")) {
-                                if let [EffectArg::Closure(value, block)] = &mut args[..] {
-                                    *value = analysis_state
-                                        .link_value(take(value), ImportAttributes::empty_ref())
-                                        .await?;
-                                    if let JsValue::Function(_, func_ident, _) = value {
-                                        let mut closure_arg = JsValue::alternatives(take(values));
-                                        if mutable {
-                                            closure_arg.add_unknown_mutations(true);
-                                        }
-                                        analysis_state
-                                            .fun_args_values
-                                            .get_mut()
-                                            .insert(*func_ident, vec![closure_arg]);
-                                        queue_stack.get_mut().push(Action::LeaveScope(*func_ident));
-                                        queue_stack.get_mut().extend(
-                                            take(&mut block.effects)
-                                                .into_iter()
-                                                .map(Action::Effect)
-                                                .rev(),
-                                        );
-                                        continue;
+                            },
+                            ConditionalKind::Or { expr } => match condition.is_truthy() {
+                                Some(true) => {
+                                    // The condition value needs to stay since it's used
+                                    inactive!(expr);
+                                }
+                                Some(false) => {
+                                    condition!(ConstantConditionValue::Falsy);
+                                    active!(expr);
+                                }
+                                None => {
+                                    active!(expr);
+                                }
+                            },
+                            ConditionalKind::NullishCoalescing { expr } => {
+                                match condition.is_nullish() {
+                                    Some(true) => {
+                                        condition!(ConstantConditionValue::Nullish);
+                                        active!(expr);
+                                    }
+                                    Some(false) => {
+                                        inactive!(expr);
+                                    }
+                                    None => {
+                                        active!(expr);
                                     }
                                 }
                             }
                         }
                     }
-
-                    let func = analysis_state
-                        .link_value(
-                            JsValue::member(Box::new(obj.clone()), Box::new(prop)),
-                            ImportAttributes::empty_ref(),
-                        )
-                        .await?;
-
-                    handle_call(
-                        &ast_path,
-                        span,
+                    Effect::Call {
                         func,
-                        obj,
                         args,
-                        &analysis_state,
-                        &add_effects,
-                        &mut analysis,
+                        ast_path,
+                        span,
                         in_try,
                         new,
-                    )
-                    .await?;
-                }
-                Effect::FreeVar {
-                    var,
-                    ast_path,
-                    span,
-                    in_try: _,
-                } => {
-                    // FreeVar("require") might be turbopackIgnore-d
-                    if !analysis_state
-                        .link_value(*var.clone(), eval_context.imports.get_attributes(span))
-                        .await?
-                        .is_unknown()
-                    {
-                        handle_free_var(&ast_path, *var, span, &analysis_state, &mut analysis)
+                    } => {
+                        if let Some(ignored) = &ignore_effect_span {
+                            if *ignored == span {
+                                return anyhow::Ok(());
+                            }
+                        }
+
+                        let func = analysis_state
+                            .link_value(*func, eval_context.imports.get_attributes(span))
+                            .await?;
+
+                        add_effects(
+                            queue_stack,
+                            handle_call(
+                                &ast_path,
+                                span,
+                                func,
+                                JsValue::unknown_empty(false, "no this provided"),
+                                args,
+                                &analysis_state,
+                                &mut analysis,
+                                in_try,
+                                new,
+                            )
+                            .await?,
+                        );
+                    }
+                    Effect::MemberCall {
+                        obj,
+                        prop,
+                        mut args,
+                        ast_path,
+                        span,
+                        in_try,
+                        new,
+                    } => {
+                        if let Some(ignored) = &ignore_effect_span {
+                            if *ignored == span {
+                                return anyhow::Ok(());
+                            }
+                        }
+                        let mut obj = analysis_state
+                            .link_value(*obj, ImportAttributes::empty_ref())
+                            .await?;
+                        let prop = analysis_state
+                            .link_value(*prop, ImportAttributes::empty_ref())
+                            .await?;
+
+                        if !new {
+                            if let JsValue::Array {
+                                items: ref mut values,
+                                mutable,
+                                ..
+                            } = obj
+                            {
+                                if matches!(prop.as_str(), Some("map" | "forEach" | "filter")) {
+                                    if let [EffectArg::Closure(value, block)] = &mut args[..] {
+                                        *value = analysis_state
+                                            .link_value(take(value), ImportAttributes::empty_ref())
+                                            .await?;
+                                        if let JsValue::Function(_, func_ident, _) = value {
+                                            let mut closure_arg =
+                                                JsValue::alternatives(take(values));
+                                            if mutable {
+                                                closure_arg.add_unknown_mutations(true);
+                                            }
+                                            analysis_state
+                                                .fun_args_values
+                                                .get_mut()
+                                                .insert(*func_ident, vec![closure_arg]);
+                                            queue_stack
+                                                .get_mut()
+                                                .push(Action::LeaveScope(*func_ident));
+                                            queue_stack.get_mut().extend(
+                                                take(&mut block.effects)
+                                                    .into_iter()
+                                                    .map(Action::Effect)
+                                                    .rev(),
+                                            );
+                                            return anyhow::Ok(());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let func = analysis_state
+                            .link_value(
+                                JsValue::member(Box::new(obj.clone()), Box::new(prop)),
+                                ImportAttributes::empty_ref(),
+                            )
+                            .await?;
+
+                        add_effects(
+                            queue_stack,
+                            handle_call(
+                                &ast_path,
+                                span,
+                                func,
+                                obj,
+                                args,
+                                &analysis_state,
+                                &mut analysis,
+                                in_try,
+                                new,
+                            )
+                            .await?,
+                        );
+                    }
+                    Effect::FreeVar {
+                        var,
+                        ast_path,
+                        span,
+                        in_try: _,
+                    } => {
+                        // FreeVar("require") might be turbopackIgnore-d
+                        if !analysis_state
+                            .link_value(*var.clone(), eval_context.imports.get_attributes(span))
+                            .await?
+                            .is_unknown()
+                        {
+                            handle_free_var(&ast_path, *var, span, &analysis_state, &mut analysis)
+                                .await?;
+                        }
+                    }
+                    Effect::Member {
+                        obj,
+                        prop,
+                        ast_path,
+                        span,
+                        in_try: _,
+                    } => {
+                        let obj_count = obj.total_nodes();
+                        let prop_count = prop.total_nodes();
+                        let s = tracing::info_span!(
+                            "link_value obj",
+                            depth = obj_count,
+                            obj = %obj,
+                            value = tracing::field::Empty
+                        );
+                        let obj = analysis_state
+                            .link_value(*obj.clone(), ImportAttributes::empty_ref())
+                            .instrument(s.clone())
+                            .await?;
+                        s.record("value", obj.to_string());
+
+                        let s = tracing::info_span!(
+                            "link_value prop",
+                            depth = prop_count,
+                            prop = %prop,
+                            value = tracing::field::Empty
+                        );
+                        let prop = analysis_state
+                            .link_value(*prop.clone(), ImportAttributes::empty_ref())
+                            .instrument(s.clone())
+                            .await?;
+                        s.record("value", prop.to_string());
+
+                        handle_member(&ast_path, obj, prop, span, &analysis_state, &mut analysis)
+                            .instrument(tracing::info_span!("handle_member"))
                             .await?;
                     }
-                }
-                Effect::Member {
-                    obj,
-                    prop,
-                    ast_path,
-                    span,
-                    in_try: _,
-                } => {
-                    let obj = analysis_state
-                        .link_value(*obj, ImportAttributes::empty_ref())
-                        .await?;
-                    let prop = analysis_state
-                        .link_value(*prop, ImportAttributes::empty_ref())
-                        .await?;
-
-                    handle_member(&ast_path, obj, prop, span, &analysis_state, &mut analysis)
-                        .await?;
-                }
-                Effect::ImportedBinding {
-                    esm_reference_index,
-                    export,
-                    ast_path,
-                    span: _,
-                    in_try: _,
-                } => {
-                    if let Some(&r) = import_references.get(esm_reference_index) {
-                        if let Some("__turbopack_module_id__") = export.as_deref() {
-                            analysis.add_reference(
-                                EsmModuleIdAssetReference::new(*r, Vc::cell(ast_path))
-                                    .to_resolved()
-                                    .await?,
-                            )
-                        } else {
-                            let r = match options.tree_shaking_mode {
-                                Some(TreeShakingMode::ReexportsOnly) => {
-                                    let r_ref = r.await?;
-                                    if r_ref.export_name.is_none() && export.is_some() {
-                                        let export = export.clone().unwrap();
-                                        EsmAssetReference::new(
-                                            r_ref.origin,
-                                            r_ref.request,
-                                            r_ref.issue_source,
-                                            Value::new(r_ref.annotations.clone()),
-                                            Some(ModulePart::export(export).to_resolved().await?),
-                                            r_ref.import_externals,
-                                        )
+                    Effect::ImportedBinding {
+                        esm_reference_index,
+                        export,
+                        ast_path,
+                        span: _,
+                        in_try: _,
+                    } => {
+                        if let Some(&r) = import_references.get(esm_reference_index) {
+                            if let Some("__turbopack_module_id__") = export.as_deref() {
+                                analysis.add_reference(
+                                    EsmModuleIdAssetReference::new(*r, Vc::cell(ast_path))
                                         .to_resolved()
-                                        .await?
-                                    } else {
-                                        r
+                                        .await?,
+                                )
+                            } else {
+                                let r = match options.tree_shaking_mode {
+                                    Some(TreeShakingMode::ReexportsOnly) => {
+                                        let r_ref = r.await?;
+                                        if r_ref.export_name.is_none() && export.is_some() {
+                                            let export = export.clone().unwrap();
+                                            EsmAssetReference::new(
+                                                r_ref.origin,
+                                                r_ref.request,
+                                                r_ref.issue_source,
+                                                Value::new(r_ref.annotations.clone()),
+                                                Some(
+                                                    ModulePart::export(export)
+                                                        .to_resolved()
+                                                        .await?,
+                                                ),
+                                                r_ref.import_externals,
+                                            )
+                                            .to_resolved()
+                                            .await?
+                                        } else {
+                                            r
+                                        }
                                     }
-                                }
-                                _ => r,
-                            };
+                                    _ => r,
+                                };
 
-                            analysis.add_local_reference(r);
-                            analysis.add_import_reference(r);
-                            analysis.add_binding(EsmBinding::new(
-                                r,
-                                export,
-                                ResolvedVc::cell(ast_path),
-                            ));
+                                analysis.add_local_reference(r);
+                                analysis.add_import_reference(r);
+                                analysis.add_binding(EsmBinding::new(
+                                    r,
+                                    export,
+                                    ResolvedVc::cell(ast_path),
+                                ));
+                            }
                         }
                     }
-                }
-                Effect::TypeOf {
-                    arg,
-                    ast_path,
-                    span,
-                } => {
-                    let arg = analysis_state
-                        .link_value(*arg, ImportAttributes::empty_ref())
-                        .await?;
-                    handle_typeof(&ast_path, arg, span, &analysis_state, &mut analysis).await?;
-                }
-                Effect::ImportMeta {
-                    ast_path,
-                    span: _,
-                    in_try: _,
-                } => {
-                    if analysis_state.first_import_meta {
-                        analysis_state.first_import_meta = false;
-                        analysis.add_code_gen(ImportMetaBinding::new(source.ident().path()));
+                    Effect::TypeOf {
+                        arg,
+                        ast_path,
+                        span,
+                    } => {
+                        let arg = analysis_state
+                            .link_value(*arg, ImportAttributes::empty_ref())
+                            .await?;
+                        handle_typeof(&ast_path, arg, span, &analysis_state, &mut analysis).await?;
+                        return anyhow::Ok(());
                     }
+                    Effect::ImportMeta {
+                        ast_path,
+                        span: _,
+                        in_try: _,
+                    } => {
+                        if analysis_state.first_import_meta {
+                            analysis_state.first_import_meta = false;
+                            analysis.add_code_gen(ImportMetaBinding::new(source.ident().path()));
+                        }
 
-                    analysis.add_code_gen(ImportMetaRef::new(Vc::cell(ast_path)));
+                        analysis.add_code_gen(ImportMetaRef::new(Vc::cell(ast_path)));
+                    }
                 }
+                anyhow::Ok(())
             }
         }
         anyhow::Ok(())
@@ -1415,18 +1492,17 @@ async fn compile_time_info_for_module_type(
     .cell())
 }
 
-async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
+async fn handle_call(
     ast_path: &[AstParentKind],
     span: Span,
     func: JsValue,
     this: JsValue,
     args: Vec<EffectArg>,
     state: &AnalysisState<'_>,
-    add_effects: &G,
     analysis: &mut AnalyzeEcmascriptModuleResultBuilder,
     in_try: bool,
     new: bool,
-) -> Result<()> {
+) -> Result<Vec<Effect>> {
     let &AnalysisState {
         handler,
         origin,
@@ -1439,26 +1515,19 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
     fn explain_args(args: &[JsValue]) -> (String, String) {
         JsValue::explain_args(args, 10, 2)
     }
-    let linked_args = |args: Vec<EffectArg>| async move {
+    let mut effects = vec![];
+    let mut linked_args = |args: Vec<EffectArg>| {
         args.into_iter()
-            .map(|arg| {
-                let add_effects = &add_effects;
-                async move {
-                    let value = match arg {
-                        EffectArg::Value(value) => value,
-                        EffectArg::Closure(value, block) => {
-                            add_effects(block.effects);
-                            value
-                        }
-                        EffectArg::Spread => {
-                            JsValue::unknown_empty(true, "spread is not supported yet")
-                        }
-                    };
-                    state.link_value(value, ImportAttributes::empty_ref()).await
+            .map(|arg| match arg {
+                EffectArg::Value(value) => value,
+                EffectArg::Closure(value, block) => {
+                    effects.extend(block.effects);
+                    value
                 }
+                EffectArg::Spread => JsValue::unknown_empty(true, "spread is not supported yet"),
             })
+            .map(|value| state.link_value(value, ImportAttributes::empty_ref()))
             .try_join()
-            .await
     };
 
     if new {
@@ -1484,7 +1553,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                                 ),
                             );
                             if ignore_dynamic_requests {
-                                return Ok(());
+                                return Ok(effects);
                             }
                         }
                         analysis.add_reference(
@@ -1504,7 +1573,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                         );
                     }
                 }
-                return Ok(());
+                return Ok(effects);
             }
             JsValue::WellKnownFunction(WellKnownFunctionKind::WorkerConstructor) => {
                 let args = linked_args(args).await?;
@@ -1520,7 +1589,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                             ),
                         );
                         if ignore_dynamic_requests {
-                            return Ok(());
+                            return Ok(effects);
                         }
                     }
 
@@ -1538,7 +1607,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                         );
                     }
 
-                    return Ok(());
+                    return Ok(effects);
                 }
                 let (args, hints) = explain_args(&args);
                 handler.span_warn_with_code(
@@ -1548,17 +1617,17 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                         errors::failed_to_analyse::ecmascript::DYNAMIC_IMPORT.to_string(),
                     ),
                 );
-                return Ok(());
+                return Ok(effects);
             }
             _ => {}
         }
 
         for arg in args {
             if let EffectArg::Closure(_, block) = arg {
-                add_effects(block.effects);
+                effects.extend(block.effects);
             }
         }
-        return Ok(());
+        return Ok(effects);
     }
 
     match func {
@@ -1575,7 +1644,6 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                     this.clone(),
                     args.clone(),
                     state,
-                    add_effects,
                     analysis,
                     in_try,
                     new,
@@ -1622,7 +1690,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                         analysis.add_code_gen(DynamicExpression::new_promise(Vc::cell(
                             ast_path.to_vec(),
                         )));
-                        return Ok(());
+                        return Ok(effects);
                     }
                 }
                 analysis.add_reference(
@@ -1638,7 +1706,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                     .to_resolved()
                     .await?,
                 );
-                return Ok(());
+                return Ok(effects);
             }
             let (args, hints) = explain_args(&args);
             handler.span_warn_with_code(
@@ -1664,7 +1732,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                     );
                     if ignore_dynamic_requests {
                         analysis.add_code_gen(DynamicExpression::new(Vc::cell(ast_path.to_vec())));
-                        return Ok(());
+                        return Ok(effects);
                     }
                 }
                 analysis.add_reference(
@@ -1678,7 +1746,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                     .to_resolved()
                     .await?,
                 );
-                return Ok(());
+                return Ok(effects);
             }
             let (args, hints) = explain_args(&args);
             handler.span_warn_with_code(
@@ -1718,7 +1786,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                     );
                     if ignore_dynamic_requests {
                         analysis.add_code_gen(DynamicExpression::new(Vc::cell(ast_path.to_vec())));
-                        return Ok(());
+                        return Ok(effects);
                     }
                 }
                 analysis.add_reference(
@@ -1732,7 +1800,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                     .to_resolved()
                     .await?,
                 );
-                return Ok(());
+                return Ok(effects);
             }
             let (args, hints) = explain_args(&args);
             handler.span_warn_with_code(
@@ -1760,7 +1828,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                             errors::failed_to_analyse::ecmascript::REQUIRE_CONTEXT.to_string(),
                         ),
                     );
-                    return Ok(());
+                    return Ok(effects);
                 }
             };
 
@@ -1794,7 +1862,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                         ),
                     );
                     if ignore_dynamic_requests {
-                        return Ok(());
+                        return Ok(effects);
                     }
                 }
                 analysis.add_reference(
@@ -1802,7 +1870,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                         .to_resolved()
                         .await?,
                 );
-                return Ok(());
+                return Ok(effects);
             }
             let (args, hints) = explain_args(&args);
             handler.span_warn_with_code(
@@ -1841,7 +1909,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                     ),
                 );
                 if ignore_dynamic_requests {
-                    return Ok(());
+                    return Ok(effects);
                 }
             }
             analysis.add_reference(
@@ -1849,14 +1917,14 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                     .to_resolved()
                     .await?,
             );
-            return Ok(());
+            return Ok(effects);
         }
 
         JsValue::WellKnownFunction(WellKnownFunctionKind::PathJoin) => {
             let context_path = source.ident().path().await?;
             // ignore path.join in `node-gyp`, it will includes too many files
             if context_path.path.contains("node_modules/node-gyp") {
-                return Ok(());
+                return Ok(effects);
             }
             let args = linked_args(args).await?;
             let linked_func_call = state
@@ -1879,7 +1947,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                     ),
                 );
                 if ignore_dynamic_requests {
-                    return Ok(());
+                    return Ok(effects);
                 }
             }
             analysis.add_reference(
@@ -1887,14 +1955,14 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                     .to_resolved()
                     .await?,
             );
-            return Ok(());
+            return Ok(effects);
         }
         JsValue::WellKnownFunction(WellKnownFunctionKind::ChildProcessSpawnMethod(name)) => {
             let args = linked_args(args).await?;
 
             // Is this specifically `spawn(process.argv[0], ['-e', ...])`?
             if is_invoking_node_process_eval(&args) {
-                return Ok(());
+                return Ok(effects);
             }
 
             if !args.is_empty() {
@@ -1945,7 +2013,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                         ),
                     );
                 }
-                return Ok(());
+                return Ok(effects);
             }
             let (args, hints) = explain_args(&args);
             handler.span_warn_with_code(
@@ -1971,7 +2039,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                         ),
                     );
                     if ignore_dynamic_requests {
-                        return Ok(());
+                        return Ok(effects);
                     }
                 }
                 analysis.add_reference(
@@ -1984,7 +2052,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                     .to_resolved()
                     .await?,
                 );
-                return Ok(());
+                return Ok(effects);
             }
             let (args, hints) = explain_args(&args);
             handler.span_warn_with_code(
@@ -2012,7 +2080,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                         ),
                     );
                     // Always ignore this dynamic request
-                    return Ok(());
+                    return Ok(effects);
                 }
                 analysis.add_reference(
                     NodePreGypConfigReference::new(
@@ -2023,7 +2091,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                     .to_resolved()
                     .await?,
                 );
-                return Ok(());
+                return Ok(effects);
             }
             let (args, hints) = explain_args(&args);
             handler.span_warn_with_code(
@@ -2059,7 +2127,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                         .to_resolved()
                         .await?,
                     );
-                    return Ok(());
+                    return Ok(effects);
                 }
             }
             let (args, hints) = explain_args(&args);
@@ -2087,7 +2155,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                             .to_resolved()
                             .await?,
                     );
-                    return Ok(());
+                    return Ok(effects);
                 }
             }
             let (args, hints) = explain_args(&args);
@@ -2115,7 +2183,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                             ),
                         );
                         // Always ignore this dynamic request
-                        return Ok(());
+                        return Ok(effects);
                     }
                     match s {
                         "views" => {
@@ -2144,7 +2212,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                                         .to_resolved()
                                         .await?,
                                 );
-                                return Ok(());
+                                return Ok(effects);
                             }
                         }
                         "view engine" => {
@@ -2162,7 +2230,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                                         .await?,
                                     );
                                 }
-                                return Ok(());
+                                return Ok(effects);
                             }
                         }
                         _ => {}
@@ -2206,7 +2274,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                         .to_resolved()
                         .await?,
                 );
-                return Ok(());
+                return Ok(effects);
             }
             let (args, hints) = explain_args(&args);
             handler.span_warn_with_code(
@@ -2233,7 +2301,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                     .to_resolved()
                     .await?,
                 );
-                return Ok(());
+                return Ok(effects);
             }
             let (args, hints) = explain_args(&args);
             handler.span_warn_with_code(
@@ -2274,7 +2342,7 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
                         analysis.add_reference(resolved_dir_ref);
                     }
 
-                    return Ok(());
+                    return Ok(effects);
                 }
             }
             let (args, hints) = explain_args(&args);
@@ -2292,12 +2360,12 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
         _ => {
             for arg in args {
                 if let EffectArg::Closure(_, block) = arg {
-                    add_effects(block.effects);
+                    effects.extend(block.effects);
                 }
             }
         }
     }
-    Ok(())
+    Ok(effects)
 }
 
 async fn handle_member(
