@@ -20,6 +20,7 @@ pub mod worker;
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap},
+    future::Future,
     mem::take,
     sync::Arc,
 };
@@ -122,7 +123,7 @@ use crate::{
         builtin::early_replace_builtin,
         graph::{ConditionalKind, EffectArg, EvalContext, VarGraph},
         imports::{ImportAnnotations, ImportAttributes, ImportedSymbol, Reexport},
-        parse_require_context,
+        match_free_var_reference, parse_require_context,
         top_level_await::has_top_level_await,
         ConstantNumber, ConstantString, JsValueUrlKind, RequireContextValue,
     },
@@ -1269,20 +1270,23 @@ pub(crate) async fn analyse_ecmascript_module_internal(
                     span,
                     in_try: _,
                 } => {
-                    let obj_count = obj.total_nodes();
-                    let prop_count = prop.total_nodes();
-                    let s = tracing::info_span!(
-                        "link_value obj",
-                        depth = obj_count,
-                        obj = %obj,
-                        value = tracing::field::Empty
-                    );
-                    let obj = analysis_state
-                        .link_value(*obj.clone(), ImportAttributes::empty_ref())
-                        .instrument(s.clone())
-                        .await?;
-                    s.record("value", obj.to_string());
+                    let obj = async {
+                        let obj_count = obj.total_nodes();
+                        let s = tracing::info_span!(
+                            "link_value obj",
+                            depth = obj_count,
+                            obj = %obj,
+                            value = tracing::field::Empty
+                        );
+                        let obj = analysis_state
+                            .link_value(*obj.clone(), ImportAttributes::empty_ref())
+                            .instrument(s.clone())
+                            .await?;
+                        s.record("value", obj.to_string());
+                        Ok(obj)
+                    };
 
+                    let prop_count = prop.total_nodes();
                     let s = tracing::info_span!(
                         "link_value prop",
                         depth = prop_count,
@@ -2325,39 +2329,53 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
 
 async fn handle_member(
     ast_path: &[AstParentKind],
-    obj: JsValue,
+    link_obj: impl Future<Output = Result<JsValue>> + Send + Sync,
     prop: JsValue,
     span: Span,
     state: &AnalysisState<'_>,
     analysis: &mut AnalyzeEcmascriptModuleResultBuilder,
 ) -> Result<()> {
+    let mut obj_cache: Option<JsValue> = None;
+    macro_rules! get_obj {
+        () => {
+            if let Some(obj) = &obj_cache {
+                obj
+            } else {
+                // obj_cache = Some(link_obj.await?);
+                obj_cache.as_ref().unwrap()
+            }
+        };
+    }
+
     if let Some(prop) = prop.as_str() {
-        let prop = DefineableNameSegment::Name(prop.into());
-        if let Some(def_name_len) = obj.get_defineable_name_len() {
-            let compile_time_info = state.compile_time_info.await?;
-            let free_var_references = compile_time_info.free_var_references.individual().await?;
-            for (name, value) in free_var_references.iter() {
-                if name.len() != def_name_len + 1 {
-                    continue;
-                }
-                let mut it = name.iter().map(Cow::Borrowed).rev();
-                if it.next().unwrap().as_ref() != &prop {
-                    continue;
-                }
-                if it.eq(obj.iter_defineable_name_rev())
-                    && handle_free_var_reference(ast_path, &*value.await?, span, state, analysis)
+        let prop_seg = DefineableNameSegment::Name(prop.into());
+        let compile_time_info = state.compile_time_info.await?;
+        let free_var_references = compile_time_info.free_var_references.individual().await?;
+
+        if let Some(references) = free_var_references.get(&prop_seg) {
+            let obj = get_obj!();
+            if obj.get_defineable_name_len().is_some() {
+                for (name, value) in references {
+                    let it = name.iter().map(Cow::Borrowed).rev();
+                    if it.eq(obj.iter_defineable_name_rev())
+                        && handle_free_var_reference(
+                            ast_path,
+                            &*value.await?,
+                            span,
+                            state,
+                            analysis,
+                        )
                         .await?
-                {
-                    return Ok(());
+                    {
+                        return Ok(());
+                    }
                 }
             }
         }
-    }
-    match (obj, prop) {
-        (
-            JsValue::WellKnownFunction(WellKnownFunctionKind::Require { .. }),
-            JsValue::Constant(s),
-        ) if s.as_str() == Some("cache") => {
+
+        if let (JsValue::WellKnownFunction(WellKnownFunctionKind::Require { .. }), "cache") =
+            (get_obj!(), prop)
+        {
             analysis.add_code_gen(
                 CjsRequireCacheAccess {
                     path: ResolvedVc::cell(ast_path.to_vec()),
@@ -2365,7 +2383,6 @@ async fn handle_member(
                 .cell(),
             );
         }
-        _ => {}
     }
 
     Ok(())
@@ -2378,7 +2395,8 @@ async fn handle_typeof(
     state: &AnalysisState<'_>,
     analysis: &mut AnalyzeEcmascriptModuleResultBuilder,
 ) -> Result<()> {
-    if let Some(value) = arg.match_free_var_reference(
+    if let Some(value) = match_free_var_reference(
+        &arg,
         Some(state.var_graph),
         &*state
             .compile_time_info
@@ -2386,7 +2404,7 @@ async fn handle_typeof(
             .free_var_references
             .individual()
             .await?,
-        &Some(DefineableNameSegment::TypeOf),
+        &DefineableNameSegment::TypeOf,
     ) {
         handle_free_var_reference(ast_path, &*value.await?, span, state, analysis).await?;
     }
@@ -2401,20 +2419,18 @@ async fn handle_free_var(
     state: &AnalysisState<'_>,
     analysis: &mut AnalyzeEcmascriptModuleResultBuilder,
 ) -> Result<()> {
-    if let Some(def_name_len) = var.get_defineable_name_len() {
+    if var.get_defineable_name_len().is_some() {
         let compile_time_info = state.compile_time_info.await?;
         let free_var_references = compile_time_info.free_var_references.individual().await?;
-        for (name, value) in free_var_references.iter() {
-            if name.len() != def_name_len {
-                continue;
-            }
-
-            if var
-                .iter_defineable_name_rev()
-                .eq(name.iter().map(Cow::Borrowed).rev())
-            {
-                handle_free_var_reference(ast_path, &*value.await?, span, state, analysis).await?;
-                return Ok(());
+        let first = var.iter_defineable_name_rev().next().unwrap();
+        if let Some(references) = free_var_references.get(&*first) {
+            for (name, value) in references {
+                let it = name.iter().map(Cow::Borrowed).rev();
+                if it.eq(var.iter_defineable_name_rev().skip(1)) {
+                    handle_free_var_reference(ast_path, &*value.await?, span, state, analysis)
+                        .await?;
+                    return Ok(());
+                }
             }
         }
     }
@@ -2752,10 +2768,11 @@ async fn value_visitor_inner(
     if v.get_defineable_name_len().is_some() {
         let compile_time_info = compile_time_info.await?;
         if let JsValue::TypeOf(..) = v {
-            if let Some(value) = v.match_free_var_reference(
+            if let Some(value) = match_free_var_reference(
+                &v,
                 Some(var_graph),
                 &*compile_time_info.free_var_references.individual().await?,
-                &None,
+                &DefineableNameSegment::TypeOf,
             ) {
                 return Ok(((&*value.await?).into(), true));
             }
