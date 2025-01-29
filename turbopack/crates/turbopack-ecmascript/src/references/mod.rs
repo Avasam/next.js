@@ -1147,7 +1147,7 @@ pub(crate) async fn analyse_ecmascript_module_internal(
                 } => {
                     if let Some(ignored) = &ignore_effect_span {
                         if *ignored == span {
-                            return anyhow::Ok(());
+                            continue;
                         }
                     }
 
@@ -1181,7 +1181,7 @@ pub(crate) async fn analyse_ecmascript_module_internal(
                 } => {
                     if let Some(ignored) = &ignore_effect_span {
                         if *ignored == span {
-                            return anyhow::Ok(());
+                            continue;
                         }
                     }
                     let mut obj = analysis_state
@@ -1219,7 +1219,7 @@ pub(crate) async fn analyse_ecmascript_module_internal(
                                                 .map(Action::Effect)
                                                 .rev(),
                                         );
-                                        return anyhow::Ok(());
+                                        continue;
                                     }
                                 }
                             }
@@ -1357,7 +1357,6 @@ pub(crate) async fn analyse_ecmascript_module_internal(
                         .link_value(*arg, ImportAttributes::empty_ref())
                         .await?;
                     handle_typeof(&ast_path, arg, span, &analysis_state, &mut analysis).await?;
-                    return anyhow::Ok(());
                 }
                 Effect::ImportMeta {
                     ast_path,
