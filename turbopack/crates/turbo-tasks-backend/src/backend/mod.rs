@@ -1343,7 +1343,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
 
         drop(task);
 
-        {
+        if has_children {
             let _span = tracing::trace_span!("connect new children").entered();
             queue.execute(&mut ctx);
         }
