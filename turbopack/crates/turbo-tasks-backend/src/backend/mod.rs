@@ -1215,7 +1215,7 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
         // Filter actual new children
         let mut kept_children = SmallVec::new();
         for old_child in iter_many!(task, Child { task } => task) {
-            if !new_children.remove(&old_child) {
+            if !has_children || !new_children.remove(&old_child) {
                 old_edges.push(OutdatedEdge::Child(old_child));
             } else {
                 kept_children.push(old_child);
