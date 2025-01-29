@@ -1335,8 +1335,11 @@ impl<B: BackingStorage> TurboTasksBackendInner<B> {
 
         let mut queue = AggregationUpdateQueue::new();
 
-        let active_count = get!(task, Activeness).map_or(0, |activeness| activeness.active_counter);
-        connect_children(task_id, &mut task, new_children, &mut queue, active_count);
+        if has_children {
+            let active_count =
+                get!(task, Activeness).map_or(0, |activeness| activeness.active_counter);
+            connect_children(task_id, &mut task, new_children, &mut queue, active_count);
+        }
 
         drop(task);
 
