@@ -838,44 +838,14 @@ pub async fn all_entrypoints_write_to_disk_operation(
 
 #[turbo_tasks::function(operation)]
 async fn output_assets_operation(
-    project: ResolvedVc<ProjectContainer>,
+    container: ResolvedVc<ProjectContainer>,
     app_dir_only: ResolvedVc<bool>,
 ) -> Result<Vc<OutputAssets>> {
     let mut output_assets: IndexSet<ResolvedVc<Box<dyn OutputAsset>>> = IndexSet::new();
     let app_dir_only = *app_dir_only.await?;
 
-    let entrypoints = &*project.entrypoints().await?;
-    for route in entrypoints.routes.values() {
-        match route {
-            Route::Page {
-                html_endpoint,
-                data_endpoint,
-            } => {
-                if app_dir_only {
-                    continue;
-                }
-
-                output_assets.extend(html_endpoint.output().await?.output_assets.await?);
-                output_assets.extend(data_endpoint.output().await?.output_assets.await?);
-            }
-            Route::PageApi { endpoint } => {
-                if app_dir_only {
-                    continue;
-                }
-
-                output_assets.extend(endpoint.output().await?.output_assets.await?);
-            }
-            Route::AppPage(pages) => {
-                for page in pages {
-                    output_assets.extend(page.html_endpoint.output().await?.output_assets.await?);
-                    output_assets.extend(page.html_endpoint.output().await?.output_assets.await?);
-                }
-            }
-            Route::AppRoute { endpoint, .. } => {
-                output_assets.extend(endpoint.output().await?.output_assets.await?);
-            }
-            Route::Conflict => {}
-        }
+    for endpoint in container.project().get_all_endpoints(app_dir_only).await? {
+        output_assets.extend(endpoint.output().await?.output_assets.await?);
     }
 
     Ok(Vc::cell(output_assets.iter().copied().collect()))

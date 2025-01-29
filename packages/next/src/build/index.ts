@@ -217,8 +217,9 @@ import {
   formatIssue,
   getTurbopackJsConfig,
   isPersistentCachingEnabled,
-  isRelevantWarning,
-  processIssuesForProd,
+  shouldDisplayIssue,
+  // isRelevantWarning,
+  // processIssuesForProd,
 } from '../shared/lib/turbopack/utils'
 
 type Fallback = null | boolean | string
@@ -1438,19 +1439,6 @@ export default async function build(
         )
 
         const entrypoints = await project.writeAllEntrypointsToDisk(appDirOnly)
-        const currentEntrypoints: Entrypoints = {
-          global: {
-            app: undefined,
-            document: undefined,
-            error: undefined,
-
-            middleware: undefined,
-            instrumentation: undefined,
-          },
-
-          app: new Map(),
-          page: new Map(),
-        }
 
         const manifestLoader = new TurbopackManifestLoader({
           buildId,
@@ -1462,6 +1450,17 @@ export default async function build(
           message: string
         }[] = []
         for (const issue of entrypoints.issues) {
+          if (!shouldDisplayIssue(issue)) {
+            continue
+          }
+
+          console.log(
+            'pushing issue with severity',
+            issue.severity,
+            'msg',
+            formatIssue(issue).slice(0, 40)
+          )
+
           topLevelErrors.push({
             message: formatIssue(issue),
           })
@@ -1475,14 +1474,14 @@ export default async function build(
           )
         }
 
-        const currentEntryIssues = new Map()
+        // const currentEntryIssues = new Map()
 
-        processIssuesForProd(entrypoints, true, false)
+        // processIssuesForProd(entrypoints, true, false)
 
-        await handleEntrypoints(
+        const currentEntrypoints = await handleEntrypoints(
           entrypoints,
-          manifestLoader,
-          customRoutes.rewrites
+          manifestLoader
+          // customRoutes.rewrites
         )
 
         const progress = createProgress(
@@ -1554,53 +1553,53 @@ export default async function build(
           entrypoints: currentEntrypoints,
         })
 
-        const errors: {
-          page: string
-          message: string
-        }[] = []
-        const warnings: {
-          page: string
-          message: string
-        }[] = []
-        for (const [page, entryIssues] of currentEntryIssues) {
-          for (const issue of entryIssues.values()) {
-            if (issue.severity !== 'warning') {
-              errors.push({
-                page,
-                message: formatIssue(issue),
-              })
-            } else {
-              if (isRelevantWarning(issue)) {
-                warnings.push({
-                  page,
-                  message: formatIssue(issue),
-                })
-              }
-            }
-          }
-        }
+        // const errors: {
+        //   page: string
+        //   message: string
+        // }[] = []
+        // const warnings: {
+        //   page: string
+        //   message: string
+        // }[] = []
+        // for (const [page, entryIssues] of currentEntryIssues) {
+        //   for (const issue of entryIssues.values()) {
+        //     if (issue.severity !== 'warning') {
+        //       errors.push({
+        //         page,
+        //         message: formatIssue(issue),
+        //       })
+        //     } else {
+        //       if (isRelevantWarning(issue)) {
+        //         warnings.push({
+        //           page,
+        //           message: formatIssue(issue),
+        //         })
+        //       }
+        //     }
+        //   }
+        // }
 
         const shutdownPromise = project.shutdown()
 
-        if (warnings.length > 0) {
-          Log.warn(
-            `Turbopack build collected ${warnings.length} warnings:\n${warnings
-              .map((e) => {
-                return 'Page: ' + e.page + '\n' + e.message
-              })
-              .join('\n')}`
-          )
-        }
+        // if (warnings.length > 0) {
+        //   Log.warn(
+        //     `Turbopack build collected ${warnings.length} warnings:\n${warnings
+        //       .map((e) => {
+        //         return 'Page: ' + e.page + '\n' + e.message
+        //       })
+        //       .join('\n')}`
+        //   )
+        // }
 
-        if (errors.length > 0) {
-          throw new Error(
-            `Turbopack build failed with ${errors.length} errors:\n${errors
-              .map((e) => {
-                return 'Page: ' + e.page + '\n' + e.message
-              })
-              .join('\n')}`
-          )
-        }
+        // if (errors.length > 0) {
+        //   throw new Error(
+        //     `Turbopack build failed with ${errors.length} errors:\n${errors
+        //       .map((e) => {
+        //         return 'Page: ' + e.page + '\n' + e.message
+        //       })
+        //       .join('\n')}`
+        //   )
+        // }
 
         const time = process.hrtime(startTime)
         return {

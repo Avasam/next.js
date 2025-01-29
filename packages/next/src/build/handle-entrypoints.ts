@@ -10,9 +10,8 @@ import { getEntryKey } from '../shared/lib/turbopack/entry-key'
 
 export async function handleEntrypoints(
   entrypointsOp: RawEntrypoints,
-  manifestLoader: TurbopackManifestLoader,
-  productionRewrites: CustomRoutes['rewrites'] | undefined
-): Promise<void> {
+  manifestLoader: TurbopackManifestLoader
+): Promise<Entrypoints> {
   const { middleware, instrumentation } = entrypointsOp
 
   const entrypoints = {
@@ -29,16 +28,13 @@ export async function handleEntrypoints(
       'instrumentation',
       'instrumentation'
     )
-    await manifestLoader.writeManifests({
-      devRewrites: undefined,
-      productionRewrites,
-      entrypoints,
-    })
   }
 
   if (middleware) {
     await manifestLoader.loadMiddlewareManifest('middleware', 'middleware')
   }
+
+  return entrypoints
 }
 
 export async function handlePagesErrorRoute({
