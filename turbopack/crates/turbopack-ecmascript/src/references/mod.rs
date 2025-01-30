@@ -1565,18 +1565,20 @@ async fn handle_call(
             logical_property: _,
         } => {
             for alt in values {
-                Box::pin(handle_call(
-                    ast_path,
-                    span,
-                    alt,
-                    this.clone(),
-                    args.clone(),
-                    state,
-                    analysis,
-                    in_try,
-                    new,
-                ))
-                .await?;
+                effects.extend(
+                    Box::pin(handle_call(
+                        ast_path,
+                        span,
+                        alt,
+                        this.clone(),
+                        args.clone(),
+                        state,
+                        analysis,
+                        in_try,
+                        new,
+                    ))
+                    .await?,
+                );
             }
         }
         JsValue::WellKnownFunction(WellKnownFunctionKind::Import) => {
