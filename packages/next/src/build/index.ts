@@ -212,7 +212,6 @@ import {
   handlePagesErrorRoute,
   handleRouteType,
 } from './handle-entrypoints'
-import type { Entrypoints } from './swc/types'
 import {
   formatIssue,
   getTurbopackJsConfig,
@@ -1473,10 +1472,6 @@ export default async function build(
             } issues:\n${topLevelErrors.map((e) => e.message).join('\n')}`
           )
         }
-
-        // const currentEntryIssues = new Map()
-
-        // processIssuesForProd(entrypoints, true, false)
 
         const currentEntrypoints = await handleEntrypoints(
           entrypoints,

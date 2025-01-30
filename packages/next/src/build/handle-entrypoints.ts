@@ -7,6 +7,7 @@ import type {
   RawEntrypoints,
 } from './swc/types'
 import { getEntryKey } from '../shared/lib/turbopack/entry-key'
+import * as Log from './output/log'
 
 export async function handleEntrypoints(
   entrypointsOp: RawEntrypoints,
@@ -21,7 +22,34 @@ export async function handleEntrypoints(
       error: entrypointsOp.pagesErrorEndpoint,
       instrumentation: entrypointsOp.instrumentation,
     },
+    page: new Map(),
+    app: new Map(),
   } as Entrypoints
+
+  for (const [pathname, route] of entrypointsOp.routes) {
+    switch (route.type) {
+      case 'page':
+      case 'page-api':
+        entrypoints.page.set(pathname, route)
+        break
+      case 'app-page': {
+        route.pages.forEach((page) => {
+          entrypoints.app.set(page.originalName, {
+            type: 'app-page',
+            ...page,
+          })
+        })
+        break
+      }
+      case 'app-route': {
+        entrypoints.app.set(route.originalName, route)
+        break
+      }
+      default:
+        Log.info(`skipping ${pathname} (${route.type})`)
+        break
+    }
+  }
 
   if (instrumentation) {
     await manifestLoader.loadMiddlewareManifest(
