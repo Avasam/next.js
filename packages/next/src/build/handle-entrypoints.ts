@@ -1,4 +1,3 @@
-import type { CustomRoutes } from '../lib/load-custom-routes'
 import type { TurbopackManifestLoader } from '../shared/lib/turbopack/manifest-loader'
 import type {
   Entrypoints,
@@ -9,40 +8,29 @@ import type {
 import { getEntryKey } from '../shared/lib/turbopack/entry-key'
 import * as Log from './output/log'
 
-export async function handleEntrypoints(
-  entrypointsOp: RawEntrypoints,
-  manifestLoader: TurbopackManifestLoader
+export async function rawEntrypointsToEntrypoints(
+  entrypointsOp: RawEntrypoints
 ): Promise<Entrypoints> {
-  const { middleware, instrumentation } = entrypointsOp
-
-  const entrypoints = {
-    global: {
-      app: entrypointsOp.pagesAppEndpoint,
-      document: entrypointsOp.pagesDocumentEndpoint,
-      error: entrypointsOp.pagesErrorEndpoint,
-      instrumentation: entrypointsOp.instrumentation,
-    },
-    page: new Map(),
-    app: new Map(),
-  } as Entrypoints
+  const page = new Map()
+  const app = new Map()
 
   for (const [pathname, route] of entrypointsOp.routes) {
     switch (route.type) {
       case 'page':
       case 'page-api':
-        entrypoints.page.set(pathname, route)
+        page.set(pathname, route)
         break
       case 'app-page': {
-        route.pages.forEach((page) => {
-          entrypoints.app.set(page.originalName, {
+        for (const p of route.pages) {
+          app.set(p.originalName, {
             type: 'app-page',
-            ...page,
+            ...p,
           })
-        })
+        }
         break
       }
       case 'app-route': {
-        entrypoints.app.set(route.originalName, route)
+        app.set(route.originalName, route)
         break
       }
       default:
@@ -51,44 +39,17 @@ export async function handleEntrypoints(
     }
   }
 
-  if (instrumentation) {
-    await manifestLoader.loadMiddlewareManifest(
-      'instrumentation',
-      'instrumentation'
-    )
+  return {
+    global: {
+      app: entrypointsOp.pagesAppEndpoint,
+      document: entrypointsOp.pagesDocumentEndpoint,
+      error: entrypointsOp.pagesErrorEndpoint,
+      instrumentation: entrypointsOp.instrumentation,
+      middleware: entrypointsOp.middleware,
+    },
+    page,
+    app,
   }
-
-  if (middleware) {
-    await manifestLoader.loadMiddlewareManifest('middleware', 'middleware')
-  }
-
-  return entrypoints
-}
-
-export async function handlePagesErrorRoute({
-  entrypoints,
-  manifestLoader,
-  productionRewrites,
-}: {
-  entrypoints: Entrypoints
-  manifestLoader: TurbopackManifestLoader
-  productionRewrites: CustomRoutes['rewrites'] | undefined
-}) {
-  await manifestLoader.loadBuildManifest('_app')
-  await manifestLoader.loadPagesManifest('_app')
-  await manifestLoader.loadFontManifest('_app')
-
-  await manifestLoader.loadPagesManifest('_document')
-
-  await manifestLoader.loadBuildManifest('_error')
-  await manifestLoader.loadPagesManifest('_error')
-  await manifestLoader.loadFontManifest('_error')
-
-  await manifestLoader.writeManifests({
-    devRewrites: undefined,
-    productionRewrites,
-    entrypoints,
-  })
 }
 
 export async function handleRouteType({
@@ -105,10 +66,6 @@ export async function handleRouteType({
   switch (route.type) {
     case 'page': {
       const serverKey = getEntryKey('pages', 'server', page)
-
-      await manifestLoader.loadBuildManifest('_app')
-      await manifestLoader.loadPagesManifest('_app')
-      await manifestLoader.loadPagesManifest('_document')
 
       const type = await route.htmlEndpoint.runtime()
 

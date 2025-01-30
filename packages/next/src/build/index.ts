@@ -208,9 +208,8 @@ import { InvariantError } from '../shared/lib/invariant-error'
 import { HTML_LIMITED_BOT_UA_RE_STRING } from '../shared/lib/router/utils/is-bot'
 import type { UseCacheTrackerKey } from './webpack/plugins/telemetry-plugin/use-cache-tracker-utils'
 import {
-  handleEntrypoints,
-  handlePagesErrorRoute,
   handleRouteType,
+  rawEntrypointsToEntrypoints,
 } from './handle-entrypoints'
 import {
   formatIssue,
@@ -1453,13 +1452,6 @@ export default async function build(
             continue
           }
 
-          console.log(
-            'pushing issue with severity',
-            issue.severity,
-            'msg',
-            formatIssue(issue).slice(0, 40)
-          )
-
           topLevelErrors.push({
             message: formatIssue(issue),
           })
@@ -1473,11 +1465,8 @@ export default async function build(
           )
         }
 
-        const currentEntrypoints = await handleEntrypoints(
-          entrypoints,
-          manifestLoader
-          // customRoutes.rewrites
-        )
+        const currentEntrypoints =
+          await rawEntrypointsToEntrypoints(entrypoints)
 
         const progress = createProgress(
           currentEntrypoints.page.size + currentEntrypoints.app.size + 1,
@@ -1533,13 +1522,29 @@ export default async function build(
           )
         }
 
-        enqueue(() =>
-          handlePagesErrorRoute({
-            entrypoints: currentEntrypoints,
-            manifestLoader,
-            productionRewrites: customRoutes.rewrites,
-          })
-        )
+        enqueue(() => manifestLoader.loadBuildManifest('_app'))
+        enqueue(() => manifestLoader.loadPagesManifest('_app'))
+        enqueue(() => manifestLoader.loadFontManifest('_app'))
+        enqueue(() => manifestLoader.loadPagesManifest('_document'))
+        enqueue(() => manifestLoader.loadBuildManifest('_error'))
+        enqueue(() => manifestLoader.loadPagesManifest('_error'))
+        enqueue(() => manifestLoader.loadFontManifest('_error'))
+
+        if (entrypoints.instrumentation) {
+          enqueue(() =>
+            manifestLoader.loadMiddlewareManifest(
+              'instrumentation',
+              'instrumentation'
+            )
+          )
+        }
+
+        if (entrypoints.middleware) {
+          enqueue(() =>
+            manifestLoader.loadMiddlewareManifest('middleware', 'middleware')
+          )
+        }
+
         await Promise.all(promises)
 
         await manifestLoader.writeManifests({
@@ -1548,54 +1553,7 @@ export default async function build(
           entrypoints: currentEntrypoints,
         })
 
-        // const errors: {
-        //   page: string
-        //   message: string
-        // }[] = []
-        // const warnings: {
-        //   page: string
-        //   message: string
-        // }[] = []
-        // for (const [page, entryIssues] of currentEntryIssues) {
-        //   for (const issue of entryIssues.values()) {
-        //     if (issue.severity !== 'warning') {
-        //       errors.push({
-        //         page,
-        //         message: formatIssue(issue),
-        //       })
-        //     } else {
-        //       if (isRelevantWarning(issue)) {
-        //         warnings.push({
-        //           page,
-        //           message: formatIssue(issue),
-        //         })
-        //       }
-        //     }
-        //   }
-        // }
-
         const shutdownPromise = project.shutdown()
-
-        // if (warnings.length > 0) {
-        //   Log.warn(
-        //     `Turbopack build collected ${warnings.length} warnings:\n${warnings
-        //       .map((e) => {
-        //         return 'Page: ' + e.page + '\n' + e.message
-        //       })
-        //       .join('\n')}`
-        //   )
-        // }
-
-        // if (errors.length > 0) {
-        //   throw new Error(
-        //     `Turbopack build failed with ${errors.length} errors:\n${errors
-        //       .map((e) => {
-        //         return 'Page: ' + e.page + '\n' + e.message
-        //       })
-        //       .join('\n')}`
-        //   )
-        // }
-
         const time = process.hrtime(startTime)
         return {
           duration: time[0] + time[1] / 1e9,
