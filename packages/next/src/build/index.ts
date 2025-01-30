@@ -18,7 +18,6 @@ import { defaultConfig } from '../server/config-shared'
 import devalue from 'next/dist/compiled/devalue'
 import findUp from 'next/dist/compiled/find-up'
 import { nanoid } from 'next/dist/compiled/nanoid/index.cjs'
-import { Sema } from 'next/dist/compiled/async-sema'
 import path from 'path'
 import {
   STATIC_STATUS_PAGE_GET_INITIAL_PROPS_ERROR,
@@ -50,7 +49,6 @@ import type {
 import { nonNullable } from '../lib/non-nullable'
 import { recursiveDelete } from '../lib/recursive-delete'
 import { verifyPartytownSetup } from '../lib/verify-partytown-setup'
-import { validateTurboNextConfig } from '../lib/turbopack-warning'
 import {
   BUILD_ID_FILE,
   BUILD_MANIFEST,
@@ -144,12 +142,7 @@ import type { NextError } from '../lib/is-error'
 import { isEdgeRuntime } from '../lib/is-edge-runtime'
 import { recursiveCopy } from '../lib/recursive-copy'
 import { recursiveReadDir } from '../lib/recursive-readdir'
-import {
-  loadBindings,
-  lockfilePatchPromise,
-  teardownTraceSubscriber,
-  createDefineEnv,
-} from './swc'
+import { lockfilePatchPromise, teardownTraceSubscriber } from './swc'
 import { getNamedRouteRegex } from '../shared/lib/router/utils/route-regex'
 import { getFilesInDir } from '../lib/get-files-in-dir'
 import { eventSwcPlugins } from '../telemetry/events/swc-plugins'
@@ -186,9 +179,7 @@ import {
 import { getStartServerInfo, logStartInfo } from '../server/lib/app-info-log'
 import type { NextEnabledDirectories } from '../server/base-server'
 import { hasCustomExportOutput } from '../export/utils'
-import { TurbopackManifestLoader } from '../shared/lib/turbopack/manifest-loader'
 import { buildCustomRoute } from '../lib/build-custom-route'
-import { createProgress } from './progress'
 import { traceMemoryUsage } from '../lib/memory/trace'
 import { generateEncryptionKeyBase64 } from '../server/app-render/encryption-utils-server'
 import type { DeepReadonly } from '../shared/lib/deep-readonly'
@@ -207,18 +198,8 @@ import {
 import { InvariantError } from '../shared/lib/invariant-error'
 import { HTML_LIMITED_BOT_UA_RE_STRING } from '../shared/lib/router/utils/is-bot'
 import type { UseCacheTrackerKey } from './webpack/plugins/telemetry-plugin/use-cache-tracker-utils'
-import {
-  handleRouteType,
-  rawEntrypointsToEntrypoints,
-} from './handle-entrypoints'
-import {
-  formatIssue,
-  getTurbopackJsConfig,
-  isPersistentCachingEnabled,
-  shouldDisplayIssue,
-  // isRelevantWarning,
-  // processIssuesForProd,
-} from '../shared/lib/turbopack/utils'
+
+import { turbopackBuild } from './turbopack-build'
 
 type Fallback = null | boolean | string
 
@@ -776,8 +757,6 @@ async function getBuildId(
     .traceAsyncFn(() => generateBuildId(config.generateBuildId, nanoid))
 }
 
-const IS_TURBOPACK_BUILD = process.env.TURBOPACK && process.env.TURBOPACK_BUILD
-
 export default async function build(
   dir: string,
   reactProductionProfiling = false,
@@ -838,6 +817,7 @@ export default async function build(
         config.distDir = '.next'
       }
       const distDir = path.join(dir, config.distDir)
+      NextBuildContext.distDir = distDir
       setGlobal('phase', PHASE_PRODUCTION_BUILD)
       setGlobal('distDir', distDir)
 
@@ -860,7 +840,7 @@ export default async function build(
         ...rewrites.fallback,
       ]
       const hasRewrites = combinedRewrites.length > 0
-
+      NextBuildContext.hasRewrites = hasRewrites
       NextBuildContext.originalRewrites = config._originalRewrites
       NextBuildContext.originalRedirects = config._originalRedirects
 
@@ -1144,7 +1124,7 @@ export default async function build(
       }
 
       // Turbopack already handles conflicting app and page routes.
-      if (!IS_TURBOPACK_BUILD) {
+      if (!turboNextBuild) {
         const numConflictingAppPaths = conflictingAppPagePaths.length
         if (mappedAppPages && numConflictingAppPaths > 0) {
           Log.error(
@@ -1361,207 +1341,6 @@ export default async function build(
         PAGES_MANIFEST
       )
 
-      async function turbopackBuild(): Promise<{
-        duration: number
-        buildTraceContext: undefined
-        shutdownPromise: Promise<void>
-      }> {
-        if (!IS_TURBOPACK_BUILD) {
-          throw new Error("next build doesn't support turbopack yet")
-        }
-
-        await validateTurboNextConfig({
-          dir,
-          isDev: false,
-        })
-
-        const startTime = process.hrtime()
-        const bindings = await loadBindings(config?.experimental?.useWasmBinary)
-        const dev = false
-
-        // const supportedBrowsers = await getSupportedBrowsers(dir, dev)
-        const supportedBrowsers = [
-          'last 1 Chrome versions, last 1 Firefox versions, last 1 Safari versions, last 1 Edge versions',
-        ]
-
-        const project = await bindings.turbo.createProject(
-          {
-            projectPath: dir,
-            rootPath:
-              config.experimental?.turbo?.root ||
-              config.outputFileTracingRoot ||
-              dir,
-            distDir,
-            nextConfig: config,
-            jsConfig: await getTurbopackJsConfig(dir, config),
-            watch: {
-              enable: false,
-            },
-            dev,
-            env: process.env as Record<string, string>,
-            defineEnv: createDefineEnv({
-              isTurbopack: true,
-              clientRouterFilters,
-              config,
-              dev,
-              distDir,
-              fetchCacheKeyPrefix: config.experimental.fetchCacheKeyPrefix,
-              hasRewrites,
-              // Implemented separately in Turbopack, doesn't have to be passed here.
-              middlewareMatchers: undefined,
-            }),
-            buildId: NextBuildContext.buildId!,
-            encryptionKey: NextBuildContext.encryptionKey!,
-            previewProps: NextBuildContext.previewProps!,
-            browserslistQuery: supportedBrowsers.join(', '),
-          },
-          {
-            persistentCaching: isPersistentCachingEnabled(config),
-            memoryLimit: config.experimental.turbo?.memoryLimit,
-          }
-        )
-
-        await fs.mkdir(path.join(distDir, 'server'), { recursive: true })
-        await fs.mkdir(path.join(distDir, 'static', buildId), {
-          recursive: true,
-        })
-        await fs.writeFile(
-          path.join(distDir, 'package.json'),
-          JSON.stringify(
-            {
-              type: 'commonjs',
-            },
-            null,
-            2
-          )
-        )
-
-        const entrypoints = await project.writeAllEntrypointsToDisk(appDirOnly)
-
-        const manifestLoader = new TurbopackManifestLoader({
-          buildId,
-          distDir,
-          encryptionKey,
-        })
-
-        const topLevelErrors: {
-          message: string
-        }[] = []
-        for (const issue of entrypoints.issues) {
-          if (!shouldDisplayIssue(issue)) {
-            continue
-          }
-
-          topLevelErrors.push({
-            message: formatIssue(issue),
-          })
-        }
-
-        if (topLevelErrors.length > 0) {
-          throw new Error(
-            `Turbopack build failed with ${
-              topLevelErrors.length
-            } issues:\n${topLevelErrors.map((e) => e.message).join('\n')}`
-          )
-        }
-
-        const currentEntrypoints =
-          await rawEntrypointsToEntrypoints(entrypoints)
-
-        const progress = createProgress(
-          currentEntrypoints.page.size + currentEntrypoints.app.size + 1,
-          'Building'
-        )
-        const promises: Promise<any>[] = []
-
-        // Concurrency will start at INITIAL_CONCURRENCY and
-        // slowly ramp up to CONCURRENCY by increasing the
-        // concurrency by 1 every time a task is completed.
-        const INITIAL_CONCURRENCY = 5
-        const CONCURRENCY = 10
-
-        const sema = new Sema(INITIAL_CONCURRENCY)
-        let remainingRampup = CONCURRENCY - INITIAL_CONCURRENCY
-        const enqueue = (fn: () => Promise<void>) => {
-          promises.push(
-            (async () => {
-              await sema.acquire()
-              try {
-                await fn()
-              } finally {
-                sema.release()
-                if (remainingRampup > 0) {
-                  remainingRampup--
-                  sema.release()
-                }
-                progress.run()
-              }
-            })()
-          )
-        }
-
-        if (!appDirOnly) {
-          for (const [page, route] of currentEntrypoints.page) {
-            enqueue(() =>
-              handleRouteType({
-                page,
-                route,
-                manifestLoader,
-              })
-            )
-          }
-        }
-
-        for (const [page, route] of currentEntrypoints.app) {
-          enqueue(() =>
-            handleRouteType({
-              page,
-              route,
-              manifestLoader,
-            })
-          )
-        }
-
-        enqueue(() => manifestLoader.loadBuildManifest('_app'))
-        enqueue(() => manifestLoader.loadPagesManifest('_app'))
-        enqueue(() => manifestLoader.loadFontManifest('_app'))
-        enqueue(() => manifestLoader.loadPagesManifest('_document'))
-        enqueue(() => manifestLoader.loadBuildManifest('_error'))
-        enqueue(() => manifestLoader.loadPagesManifest('_error'))
-        enqueue(() => manifestLoader.loadFontManifest('_error'))
-
-        if (entrypoints.instrumentation) {
-          enqueue(() =>
-            manifestLoader.loadMiddlewareManifest(
-              'instrumentation',
-              'instrumentation'
-            )
-          )
-        }
-
-        if (entrypoints.middleware) {
-          enqueue(() =>
-            manifestLoader.loadMiddlewareManifest('middleware', 'middleware')
-          )
-        }
-
-        await Promise.all(promises)
-
-        await manifestLoader.writeManifests({
-          devRewrites: undefined,
-          productionRewrites: customRoutes.rewrites,
-          entrypoints: currentEntrypoints,
-        })
-
-        const shutdownPromise = project.shutdown()
-        const time = process.hrtime(startTime)
-        return {
-          duration: time[0] + time[1] / 1e9,
-          buildTraceContext: undefined,
-          shutdownPromise,
-        }
-      }
-
       let buildTraceContext: undefined | BuildTraceContext
       let buildTracesPromise: Promise<any> | undefined = undefined
 
@@ -1610,7 +1389,7 @@ export default async function build(
             duration: compilerDuration,
             shutdownPromise: p,
             ...rest
-          } = await turbopackBuild()
+          } = await turbopackBuild(true)
           shutdownPromise = p
           traceMemoryUsage('Finished build', nextBuildSpan)
 
