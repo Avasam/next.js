@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use swc_core::{
     common::DUMMY_SP,
     ecma::ast::{
-        AssignTarget, ComputedPropName, Expr, ExprStmt, Ident, KeyValueProp, Lit, MemberExpr,
-        MemberProp, ObjectLit, Prop, PropName, PropOrSpread, SimpleAssignTarget, Stmt, Str,
+        AssignTarget, CallExpr, Callee, ComputedPropName, Expr, ExprStmt, Ident, KeyValueProp, Lit,
+        MemberExpr, MemberProp, ObjectLit, Prop, PropName, PropOrSpread, SimpleAssignTarget, Stmt,
+        Str,
     },
     quote, quote_expr,
 };
@@ -34,6 +35,7 @@ use crate::{
     chunk::{EcmascriptChunkPlaceable, EcmascriptExports},
     code_gen::{CodeGenerateable, CodeGeneration, CodeGenerationHoistedStmt},
     magic_identifier,
+    runtime_functions::{TURBOPACK_DYNAMIC, TURBOPACK_ESM},
 };
 
 #[derive(Clone, Hash, Debug, PartialEq, Eq, Serialize, Deserialize, TraceRawVcs, NonLocalValue)]
@@ -511,7 +513,7 @@ impl CodeGenerateable for EsmExports {
             .await?;
 
             dynamic_exports.push(quote_expr!(
-                "__turbopack_context__.j($arg)",
+                "{TURBOPACK_DYNAMIC}($arg)",
                 arg: Expr = Ident::new(ident.into(), DUMMY_SP, Default::default()).into()
             ));
         }
@@ -627,17 +629,23 @@ impl CodeGenerateable for EsmExports {
 
         Ok(CodeGeneration::new(
             vec![],
-            [dynamic_stmt.clone().map(|stmt| {
-                CodeGenerationHoistedStmt::new("__turbopack_context__.j".into(), stmt)
-            })]
+            [dynamic_stmt
+                .clone()
+                .map(|stmt| CodeGenerationHoistedStmt::new(TURBOPACK_DYNAMIC.into(), stmt))]
             .into_iter()
             .flatten()
             .collect(),
             vec![CodeGenerationHoistedStmt::new(
-                "__turbopack_context__.s".into(),
-                quote!("__turbopack_context__.s($getters);" as Stmt,
-                    getters: Expr = getters.clone()
-                ),
+                TURBOPACK_ESM.into(),
+                Stmt::Expr(ExprStmt {
+                    span: DUMMY_SP,
+                    expr: Box::new(Expr::Call(CallExpr {
+                        callee: Callee::Expr(Box::new(Expr::Ident(TURBOPACK_ESM.into()))),
+                        args: vec![getters.clone().into()],
+                        span: DUMMY_SP,
+                        ..Default::default()
+                    })),
+                }),
             )],
         ))
     }

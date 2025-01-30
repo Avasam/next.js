@@ -19,6 +19,7 @@ use crate::{
         data::EcmascriptChunkData, EcmascriptChunkItem, EcmascriptChunkItemContent,
         EcmascriptChunkPlaceable, EcmascriptChunkType,
     },
+    runtime_functions::{TURBOPACK_EXPORT_VALUE, TURBOPACK_LOAD},
     utils::{StringifyJs, StringifyModuleId},
 };
 
@@ -96,7 +97,7 @@ impl EcmascriptChunkItem for AsyncLoaderChunkItem {
             (Some(id), true) => {
                 formatdoc! {
                     r#"
-                        __turbopack_context__.v((__turbopack_import__) => {{
+                        {TURBOPACK_EXPORT_VALUE}((__turbopack_import__) => {{
                             return Promise.resolve().then(() => {{
                                 return __turbopack_import__({id});
                             }});
@@ -108,8 +109,8 @@ impl EcmascriptChunkItem for AsyncLoaderChunkItem {
             (Some(id), false) => {
                 formatdoc! {
                     r#"
-                        __turbopack_context__.v((__turbopack_import__) => {{
-                            return Promise.all({chunks:#}.map((chunk) => __turbopack_context__.l(chunk))).then(() => {{
+                        {TURBOPACK_EXPORT_VALUE}((__turbopack_import__) => {{
+                            return Promise.all({chunks:#}.map((chunk) => {TURBOPACK_LOAD}(chunk))).then(() => {{
                                 return __turbopack_import__({id});
                             }});
                         }});
@@ -121,7 +122,7 @@ impl EcmascriptChunkItem for AsyncLoaderChunkItem {
             (None, true) => {
                 formatdoc! {
                     r#"
-                        __turbopack_context__.v((__turbopack_import__) => {{
+                        {TURBOPACK_EXPORT_VALUE}((__turbopack_import__) => {{
                             return Promise.resolve();
                         }});
                     "#,
@@ -130,8 +131,8 @@ impl EcmascriptChunkItem for AsyncLoaderChunkItem {
             (None, false) => {
                 formatdoc! {
                     r#"
-                        __turbopack_context__.v((__turbopack_import__) => {{
-                            return Promise.all({chunks:#}.map((chunk) => __turbopack_context__.l(chunk))).then(() => {{}});
+                        {TURBOPACK_EXPORT_VALUE}((__turbopack_import__) => {{
+                            return Promise.all({chunks:#}.map((chunk) => {TURBOPACK_LOAD}(chunk))).then(() => {{}});
                         }});
                     "#,
                     chunks = StringifyJs(&chunks_data),
