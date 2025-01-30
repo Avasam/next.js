@@ -111,6 +111,7 @@ where
             // Enter a variable
             // - replace it with value from graph
             // - process value
+            // - (Step::LeaveVar potentially caches the value)
             Step::Enter(JsValue::Variable(var)) => {
                 if cycle_stack.contains(&var) {
                     done.push(JsValue::unknown(
