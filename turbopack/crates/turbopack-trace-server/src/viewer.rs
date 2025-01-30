@@ -14,6 +14,7 @@ use crate::{
     span_graph_ref::{SpanGraphEventRef, SpanGraphRef},
     span_ref::SpanRef,
     store::{SpanId, Store},
+    timestamp::Timestamp,
     u64_empty_string,
 };
 
@@ -57,8 +58,8 @@ impl ValueMode {
 
     fn value_from_span(&self, span: &SpanRef<'_>) -> u64 {
         match self {
-            ValueMode::Duration => span.corrected_total_time(),
-            ValueMode::Cpu => span.total_time(),
+            ValueMode::Duration => *span.corrected_total_time(),
+            ValueMode::Cpu => *span.total_time(),
             ValueMode::Allocations => span.total_allocations(),
             ValueMode::Deallocations => span.total_deallocations(),
             ValueMode::PersistentAllocations => span.total_persistent_allocations(),
@@ -79,8 +80,8 @@ impl ValueMode {
 
     fn value_from_graph(&self, graph: &SpanGraphRef<'_>) -> u64 {
         match self {
-            ValueMode::Duration => graph.corrected_total_time(),
-            ValueMode::Cpu => graph.total_time(),
+            ValueMode::Duration => *graph.corrected_total_time(),
+            ValueMode::Cpu => *graph.total_time(),
             ValueMode::Allocations => graph.total_allocations(),
             ValueMode::Deallocations => graph.total_deallocations(),
             ValueMode::PersistentAllocations => graph.total_persistent_allocations(),
@@ -101,8 +102,8 @@ impl ValueMode {
 
     fn value_from_graph_event(&self, event: &SpanGraphEventRef<'_>) -> u64 {
         match self {
-            ValueMode::Duration => event.corrected_total_time(),
-            ValueMode::Cpu => event.total_time(),
+            ValueMode::Duration => *event.corrected_total_time(),
+            ValueMode::Cpu => *event.total_time(),
             ValueMode::Allocations => event.total_allocations(),
             ValueMode::Deallocations => event.total_deallocations(),
             ValueMode::PersistentAllocations => event.total_persistent_allocations(),
@@ -123,8 +124,8 @@ impl ValueMode {
 
     fn value_from_bottom_up(&self, bottom_up: &SpanBottomUpRef<'_>) -> u64 {
         match self {
-            ValueMode::Duration => bottom_up.corrected_self_time(),
-            ValueMode::Cpu => bottom_up.self_time(),
+            ValueMode::Duration => *bottom_up.corrected_self_time(),
+            ValueMode::Cpu => *bottom_up.self_time(),
             ValueMode::Allocations => bottom_up.self_allocations(),
             ValueMode::Deallocations => bottom_up.self_deallocations(),
             ValueMode::PersistentAllocations => bottom_up.self_persistent_allocations(),
@@ -147,8 +148,8 @@ impl ValueMode {
 
     fn value_from_bottom_up_span(&self, bottom_up_span: &SpanRef<'_>) -> u64 {
         match self {
-            ValueMode::Duration => bottom_up_span.corrected_self_time(),
-            ValueMode::Cpu => bottom_up_span.self_time(),
+            ValueMode::Duration => *bottom_up_span.corrected_self_time(),
+            ValueMode::Cpu => *bottom_up_span.self_time(),
             ValueMode::Allocations => bottom_up_span.self_allocations(),
             ValueMode::Deallocations => bottom_up_span.self_deallocations(),
             ValueMode::PersistentAllocations => bottom_up_span.self_persistent_allocations(),
@@ -173,11 +174,11 @@ impl ValueMode {
 /// this is unfortunately int division but itll have to do.
 ///
 /// cases where count per time is very low is probably not important
-fn value_over_time(value: u64, time: u64) -> u64 {
-    if time == 0 {
+fn value_over_time(value: u64, time: Timestamp) -> u64 {
+    if *time == 0 {
         0
     } else {
-        value / time
+        value / *time
     }
 }
 
@@ -449,7 +450,7 @@ impl Viewer {
         let offset = root_spans
             .iter()
             .min_by_key(|span| span.start())
-            .map_or(0, |span| span.start());
+            .map_or(Timestamp::ZERO, |span| span.start());
         root_spans.par_iter().for_each(|span| {
             span.max_depth();
             QueueItem::Span(*span).value(value_mode);
@@ -457,7 +458,7 @@ impl Viewer {
         for span in root_spans {
             if matches!(value_mode, ValueMode::Duration) {
                 // Move current to start if needed.
-                current = max(current, span.start() - offset);
+                current = max(current, *(span.start() - offset));
             }
             if add_child_item(
                 &mut children,
@@ -978,7 +979,7 @@ impl Viewer {
                             if let Some(parent) = span.parent() {
                                 let parent_start = parent.start();
                                 let parent_duration = parent.end() - parent_start;
-                                if parent_duration > 0 {
+                                if !parent_duration.is_zero() {
                                     start_in_parent = ((span.start() - parent_start) * 10000
                                         / parent_duration)
                                         as u32;

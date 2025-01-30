@@ -13,6 +13,7 @@ use super::TraceFormat;
 use crate::{
     span::SpanIndex,
     store_container::{StoreContainer, StoreWriteGuard},
+    timestamp::Timestamp,
     FxIndexMap,
 };
 
@@ -41,20 +42,20 @@ impl InternalRow<'_> {
 enum InternalRowType<'a> {
     Start {
         new_id: u64,
-        ts: u64,
+        ts: Timestamp,
         name: Cow<'a, str>,
         target: Cow<'a, str>,
         values: Vec<(Cow<'a, str>, TraceValue<'a>)>,
     },
     End {
-        ts: u64,
+        ts: Timestamp,
     },
     SelfTime {
-        start: u64,
-        end: u64,
+        start: Timestamp,
+        end: Timestamp,
     },
     Event {
-        ts: u64,
+        ts: Timestamp,
         values: Vec<(Cow<'a, str>, TraceValue<'a>)>,
     },
     Record {
@@ -134,7 +135,7 @@ pub struct TurbopackFormat {
     outdated_spans: HashSet<SpanIndex>,
     thread_stacks: HashMap<u64, Vec<u64>>,
     thread_allocation_counters: HashMap<u64, AllocationInfo>,
-    self_time_started: HashMap<(u64, u64), u64>,
+    self_time_started: HashMap<(u64, u64), Timestamp>,
 }
 
 impl TurbopackFormat {
@@ -160,6 +161,7 @@ impl TurbopackFormat {
                 target,
                 values,
             } => {
+                let ts = Timestamp::from_micros(ts);
                 self.process_internal_row(
                     store,
                     InternalRow {
@@ -184,6 +186,7 @@ impl TurbopackFormat {
                 );
             }
             TraceRow::End { ts, id } => {
+                let ts = Timestamp::from_micros(ts);
                 self.process_internal_row(
                     store,
                     InternalRow {
@@ -193,6 +196,7 @@ impl TurbopackFormat {
                 );
             }
             TraceRow::Enter { ts, id, thread_id } => {
+                let ts = Timestamp::from_micros(ts);
                 let stack = self.thread_stacks.entry(thread_id).or_default();
                 if let Some(&parent) = stack.last() {
                     if let Some(parent_start) = self.self_time_started.remove(&(parent, thread_id))
@@ -217,6 +221,7 @@ impl TurbopackFormat {
                 self.self_time_started.insert((id, thread_id), ts);
             }
             TraceRow::Exit { ts, id, thread_id } => {
+                let ts = Timestamp::from_micros(ts);
                 let stack = self.thread_stacks.entry(thread_id).or_default();
                 if let Some(pos) = stack.iter().rev().position(|&x| x == id) {
                     let stack_index = stack.len() - pos - 1;
@@ -237,6 +242,7 @@ impl TurbopackFormat {
                 }
             }
             TraceRow::Event { ts, parent, values } => {
+                let ts = Timestamp::from_micros(ts);
                 self.process_internal_row(
                     store,
                     InternalRow {
@@ -403,10 +409,12 @@ impl TurbopackFormat {
             }
             InternalRowType::Event { ts, values } => {
                 let mut values = values.into_iter().collect::<FxIndexMap<_, _>>();
-                let duration = values
-                    .swap_remove("duration")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let duration = Timestamp::from_micros(
+                    values
+                        .swap_remove("duration")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                );
                 let name = values
                     .swap_remove("name")
                     .and_then(|v| v.as_str().map(|s| s.to_string()))
